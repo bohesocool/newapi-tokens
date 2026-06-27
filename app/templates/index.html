@@ -579,7 +579,6 @@ function renderTrend(series) {
   if (!ctx) return;
   const labels = series.map(d => d.date.slice(5));
   const real = series.map(d => d.total_real || 0);
-  const usd = series.map(d => d.total_usd || 0);
   if (trendChart) trendChart.destroy();
   const axisColor = cssVar('--text2') || '#6b7a99';
   const isLight = document.documentElement.getAttribute('data-theme') === 'light';
@@ -588,7 +587,6 @@ function renderTrend(series) {
     type: 'line',
     data: { labels, datasets: [
       { label: '实付 (USD)', data: real, borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', borderWidth: 2, tension: 0.3, fill: true, pointRadius: 2 },
-      { label: '消费 (USD)', data: usd, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.05)', borderWidth: 2, tension: 0.3, fill: false, pointRadius: 2 },
     ]},
     options: {
       responsive: true, maintainAspectRatio: false,
@@ -603,9 +601,9 @@ function renderTrend(series) {
       }
     }
   });
-  const tr = real.reduce((a, b) => a + b, 0), tu = usd.reduce((a, b) => a + b, 0);
+  const tr = real.reduce((a, b) => a + b, 0);
   document.getElementById('trendSummary').textContent =
-    `区间合计：实付 ${fmtMoney(tr)} · 消费 ${fmtMoney(tu)} · 共 ${series.length} 天`;
+    `区间合计：实付 ${fmtMoney(tr)} · 共 ${series.length} 天`;
 }
 
 // ── Channels ──
