@@ -5,3 +5,6 @@ __pycache__/
 # Runtime data (mounted volume): contains generated secrets, api key,
 # admin password hash and snapshot data — must not be committed.
 app/data/
+
+# Local environment config (real values) — use .env.example as template.
+.env

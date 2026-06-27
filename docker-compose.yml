@@ -9,12 +9,8 @@ services:
       - ./app/data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /usr/bin/docker:/usr/bin/docker:ro
-    environment:
-      - PG_CONTAINER=postgres
-      - PG_USER=root
-      - PG_DB=new-api
-      # 首次启动时的初始登录密码（之后可在「设置」页修改；改后此项不再生效）
-      - ADMIN_PASSWORD=admin
+    env_file:
+      - .env
     networks:
       - newapi-net
 
