@@ -1,0 +1,24 @@
+services:
+  newapi-monitor:
+    build: .
+    container_name: newapi-monitor
+    restart: unless-stopped
+    ports:
+      - "9217:9217"
+    volumes:
+      - ./app/data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /usr/bin/docker:/usr/bin/docker:ro
+    environment:
+      - PG_CONTAINER=postgres
+      - PG_USER=root
+      - PG_DB=new-api
+      # 首次启动时的初始登录密码（之后可在「设置」页修改；改后此项不再生效）
+      - ADMIN_PASSWORD=admin
+    networks:
+      - newapi-net
+
+networks:
+  newapi-net:
+    external: true
+    name: new-api_new-api-network

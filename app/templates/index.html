@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NewAPI Monitor</title>
+<script>document.documentElement.setAttribute('data-theme', localStorage.getItem('theme')==='light'?'light':'dark');</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<script src="/static/chart.umd.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0e1a;--card:#131722;--border:#1e2a3a;--text:#e1e7f0;--text2:#6b7a99;
+  --accent:#3b82f6;--accent2:#10b981;--accent3:#f59e0b;--accent4:#ef4444;
+  --radius:12px;--shadow:0 4px 20px rgba(0,0,0,.3);
+}
+html[data-theme="light"]{
+  --bg:#f4f6fb;--card:#ffffff;--border:#e2e8f0;--text:#1a2233;--text2:#64748b;
+  --shadow:0 4px 20px rgba(15,23,42,.06);
+}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-height:100vh;padding:20px;transition:background .2s,color .2s}
+.container{max-width:1280px;margin:0 auto}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px;gap:16px;flex-wrap:wrap}
+.header h1{font-size:28px;font-weight:800;letter-spacing:-.5px}
+.header h1 span{color:var(--accent)}
+.header-right{display:flex;align-items:center;gap:10px}
+.header .live{display:flex;align-items:center;gap:8px;color:var(--text2);font-size:14px}
+.header .live .dot{width:8px;height:8px;border-radius:50%;background:var(--accent2);box-shadow:0 0 8px var(--accent2);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.icon-btn{background:var(--card);border:1px solid var(--border);color:var(--text2);width:36px;height:36px;border-radius:9px;cursor:pointer;font-size:15px;display:flex;align-items:center;justify-content:center;transition:all .15s}
+.icon-btn:hover{color:var(--text);border-color:var(--accent)}
+.select{background:var(--card);border:1px solid var(--border);color:var(--text2);border-radius:9px;padding:7px 10px;font-size:13px;cursor:pointer}
+.select:focus{outline:none;border-color:var(--accent)}
+
+/* Grid */
+.grid{display:grid;gap:16px}
+.grid-cards{grid-template-columns:repeat(auto-fit,minmax(240px,1fr))}
+.grid-2{grid-template-columns:1fr 1fr}
+@media(max-width:900px){.grid-2{grid-template-columns:1fr}}
+
+/* Card */
+.card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow)}
+.card-title{font-size:13px;color:var(--text2);font-weight:500;text-transform:uppercase;letter-spacing:1px;margin-bottom:16px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+
+/* Stat cards */
+.stat-card{text-align:center;transition:transform .2s}
+.stat-card:hover{transform:translateY(-2px)}
+.stat-value{font-size:32px;font-weight:800;letter-spacing:-1px;margin:8px 0}
+.stat-label{font-size:12px;color:var(--text2)}
+.stat-card.green .stat-value{color:var(--accent2)}
+.stat-card.blue .stat-value{color:var(--accent)}
+.stat-card.amber .stat-value{color:var(--accent3)}
+.stat-card.red .stat-value{color:var(--accent4)}
+
+/* Chart toggle */
+.chart-toggle{display:flex;gap:2px;background:var(--bg);border-radius:6px;padding:2px}
+.chart-toggle button{background:transparent;border:none;color:var(--text2);font-size:12px;padding:4px 12px;border-radius:4px;cursor:pointer;transition:all .15s}
+.chart-toggle button.active{background:var(--accent);color:#fff}
+canvas{max-height:280px}
+
+/* Table */
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;color:var(--text2);font-weight:500;padding:10px 12px;border-bottom:1px solid var(--border);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+td{padding:12px;border-bottom:1px solid var(--border)}
+tr:hover{background:rgba(127,127,127,.04)}
+.rate-input{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 8px;width:80px;font-size:14px;text-align:center}
+.rate-input:focus{outline:none;border-color:var(--accent)}
+.name-input{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 8px;width:120px;font-size:14px}
+.name-input:focus{outline:none;border-color:var(--accent)}
+.btn{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px;font-weight:500;transition:opacity .2s}
+.btn:hover{opacity:.85}
+.btn-sm{padding:4px 10px;font-size:12px}
+.btn-danger{background:var(--accent4)}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text2)}
+.btn-ghost:hover{color:var(--text);border-color:var(--accent);opacity:1}
+
+/* Channel breakdown */
+.ch-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)}
+.ch-row:last-child{border:none}
+.ch-badge{width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;min-width:32px}
+.ch-info{flex:1}
+.ch-name{font-size:14px;font-weight:500}
+.ch-stats{font-size:12px;color:var(--text2);margin-top:2px}
+.ch-amount{text-align:right}
+.ch-amount .real{font-size:18px;font-weight:700;color:var(--accent2)}
+.ch-amount .usd{font-size:12px;color:var(--text2)}
+
+/* Tabs */
+.tabs{display:flex;gap:4px;margin-bottom:20px;background:var(--card);border-radius:var(--radius);padding:4px;width:fit-content;flex-wrap:wrap}
+.tab{padding:8px 20px;font-size:14px;font-weight:500;color:var(--text2);cursor:pointer;border-radius:8px;transition:all .15s}
+.tab.active{background:var(--accent);color:#fff}
+.tab:hover:not(.active){background:rgba(127,127,127,.08)}
+
+/* History list */
+.history-list{list-style:none}
+.history-item{display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border);cursor:pointer}
+.history-item:hover{background:rgba(127,127,127,.04)}
+.history-date{font-size:15px;font-weight:600}
+.history-stats{font-size:13px;color:var(--text2)}
+.history-real{font-size:18px;font-weight:700;color:var(--accent2)}
+
+/* Settings */
+.set-label{font-size:13px;color:var(--text2);margin-bottom:8px;font-weight:500}
+.set-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.key-input{flex:1;min-width:240px;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:13px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.code-block{position:relative;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:var(--text);white-space:pre-wrap;word-break:break-all;line-height:1.6}
+.code-block .copy{position:absolute;top:8px;right:8px}
+.set-section{margin-bottom:28px}
+.set-section:last-child{margin-bottom:0}
+.set-hint{font-size:12px;color:var(--text2);margin-top:8px;line-height:1.6}
+.pw-input{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:9px 12px;font-size:14px;width:200px}
+.pw-input:focus{outline:none;border-color:var(--accent)}
+
+.toast{position:fixed;top:20px;right:20px;background:var(--accent2);color:#fff;padding:12px 24px;border-radius:8px;font-weight:500;z-index:9999;opacity:0;transform:translateY(-10px);transition:all .3s}
+.toast.show{opacity:1;transform:translateY(0)}
+</style>
+</head>
+<body>
+<div class="container">
+  <!-- Header -->
+  <div class="header">
+    <h1>NewAPI <span>Monitor</span></h1>
+    <div class="header-right">
+      <select class="select" id="refreshSel" onchange="changeRefresh()" title="自动刷新间隔">
+        <option value="10000">10 秒</option>
+        <option value="30000">30 秒</option>
+        <option value="60000">60 秒</option>
+        <option value="0">关闭</option>
+      </select>
+      <button class="icon-btn" id="themeBtn" onclick="toggleTheme()" title="切换主题">🌙</button>
+      <button class="icon-btn" onclick="logout()" title="退出登录">⎋</button>
+      <div class="live"><span class="dot"></span><span id="liveTime">--:--</span></div>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('dashboard')">仪表盘</div>
+    <div class="tab" onclick="switchTab('channels')">渠道管理</div>
+    <div class="tab" onclick="switchTab('history')">历史日报</div>
+    <div class="tab" onclick="switchTab('settings')">设置</div>
+  </div>
+
+  <!-- Dashboard Tab -->
+  <div id="tab-dashboard">
+    <!-- Summary Cards -->
+    <div class="grid grid-cards" style="margin-bottom:16px">
+      <div class="card stat-card green">
+        <div class="stat-label">今日实付 (累计)</div>
+        <div class="stat-value" id="todayReal">$0.00</div>
+        <div class="stat-label" id="todayCalls">0 次调用</div>
+      </div>
+      <div class="card stat-card blue">
+        <div class="stat-label">今日消费 (额度)</div>
+        <div class="stat-value" id="todayUsd">$0.00</div>
+        <div class="stat-label" id="todayTokens">0 tok</div>
+      </div>
+      <div class="card stat-card amber">
+        <div class="stat-label">当前小时实付</div>
+        <div class="stat-value" id="curHourReal">$0.00</div>
+        <div class="stat-label" id="curHourRange">--:00 → --:--</div>
+      </div>
+      <div class="card stat-card red">
+        <div class="stat-label">今日每分钟均额</div>
+        <div class="stat-value" id="perMin">$0.00</div>
+        <div class="stat-label">/min</div>
+      </div>
+    </div>
+
+    <!-- Hourly Chart + Channel Breakdown -->
+    <div class="grid grid-2">
+      <div class="card">
+        <div class="card-title">
+          <span>今日逐小时实付</span>
+          <div class="chart-toggle">
+            <button class="active" onclick="switchChart('bar',this)">柱状图</button>
+            <button onclick="switchChart('line',this)">折线图</button>
+          </div>
+        </div>
+        <canvas id="hourlyChart"></canvas>
+      </div>
+      <div class="card">
+        <div class="card-title">
+          <span>渠道收益分布 (今日)</span>
+          <button class="btn btn-sm btn-ghost" onclick="exportDashboardCSV()">导出 CSV</button>
+        </div>
+        <div id="channelBreakdown"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Channels Tab -->
+  <div id="tab-channels" style="display:none">
+    <div class="card">
+      <div class="card-title">渠道系数管理</div>
+      <table id="channelsTable">
+        <thead>
+          <tr><th>ID</th><th>名称</th><th>系数</th><th>更新时间</th><th>操作</th></tr>
+        </thead>
+        <tbody id="channelsBody"></tbody>
+      </table>
+      <div style="margin-top:16px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input id="newChId" placeholder="ID" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;width:80px">
+        <input id="newChName" placeholder="渠道名称" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;width:160px">
+        <input id="newChRate" placeholder="系数" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;width:80px" type="number" step="0.001">
+        <button class="btn" onclick="addChannel()">添加渠道</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- History Tab -->
+  <div id="tab-history" style="display:none">
+    <div class="card">
+      <div class="card-title">
+        <span>历史日报</span>
+        <button class="btn btn-sm btn-ghost" onclick="exportHistoryCSV()">导出 CSV</button>
+      </div>
+      <ul class="history-list" id="historyList"></ul>
+    </div>
+  </div>
+
+  <!-- Settings Tab -->
+  <div id="tab-settings" style="display:none">
+    <div class="card" style="max-width:760px">
+      <!-- API Key -->
+      <div class="set-section">
+        <div class="card-title"><span>API Key (外部调用鉴权)</span></div>
+        <div class="set-label">将此 Key 放入请求头即可调用所有 <code>/api/*</code> 数据接口。请妥善保管。</div>
+        <div class="set-row">
+          <input class="key-input" id="apiKeyVal" readonly value="">
+          <button class="btn btn-sm btn-ghost" onclick="copyApiKey()">复制</button>
+          <button class="btn btn-sm btn-danger" onclick="regenKey()">重置</button>
+        </div>
+        <div class="set-hint">重置后旧 Key 立即失效，所有使用旧 Key 的外部调用都需要更新。</div>
+      </div>
+
+      <!-- curl examples -->
+      <div class="set-section">
+        <div class="set-label">示例：Authorization Bearer 方式</div>
+        <div class="code-block"><button class="btn btn-sm btn-ghost copy" onclick="copyText('curlBearer')">复制</button><span id="curlBearer"></span></div>
+        <div class="set-label" style="margin-top:14px">示例：X-API-Key 方式</div>
+        <div class="code-block"><button class="btn btn-sm btn-ghost copy" onclick="copyText('curlHeader')">复制</button><span id="curlHeader"></span></div>
+        <div class="set-hint">常用接口：<code>/api/hourly</code>（实时）、<code>/api/daily/2026-06-27</code>（某日）、<code>/api/history</code>（历史列表）、<code>/api/channels</code>（渠道）。<code>/api/health</code> 无需鉴权。</div>
+      </div>
+
+      <!-- Change password -->
+      <div class="set-section">
+        <div class="card-title"><span>修改登录密码</span></div>
+        <form class="set-row" onsubmit="return changePassword(event)">
+          <input class="pw-input" id="oldPw" type="password" placeholder="原密码" autocomplete="current-password">
+          <input class="pw-input" id="newPw" type="password" placeholder="新密码 (≥4 位)" autocomplete="new-password">
+          <button class="btn" type="submit">修改密码</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '';
+let hourlyChart = null;
+let chartType = 'bar';
+let pollTimer = null;
+let lastHourlyData = null;
+let lastHistory = [];
+let currentApiKey = '';
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+// Wrap fetch: on 401 (session expired) bounce to login.
+async function apiFetch(path, opts) {
+  const r = await fetch(API + path, opts);
+  if (r.status === 401) { location.href = '/login'; throw new Error('unauthorized'); }
+  return r;
+}
+
+function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
+// ── Theme ──
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  const b = document.getElementById('themeBtn');
+  if (b) b.textContent = t === 'light' ? '☀️' : '🌙';
+  if (lastHourlyData) renderChart(lastHourlyData);
+}
+function toggleTheme() {
+  const cur = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+  const next = cur === 'light' ? 'dark' : 'light';
+  localStorage.setItem('theme', next);
+  applyTheme(next);
+}
+
+// ── Refresh interval ──
+function currentRefreshMs() {
+  const v = localStorage.getItem('refreshMs');
+  return v === null ? 30000 : parseInt(v);
+}
+function applyRefresh() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  const ms = currentRefreshMs();
+  if (ms > 0) pollTimer = setInterval(loadDashboard, ms);
+}
+function changeRefresh() {
+  localStorage.setItem('refreshMs', document.getElementById('refreshSel').value);
+  applyRefresh();
+}
+
+async function logout() {
+  try { await fetch('/api/logout', { method: 'POST' }); } catch(e) {}
+  location.href = '/login';
+}
+
+function switchTab(tab) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  event.target.classList.add('active');
+  document.querySelectorAll('[id^="tab-"]').forEach(el => el.style.display = 'none');
+  document.getElementById('tab-' + tab).style.display = '';
+  if (tab === 'channels') loadChannels();
+  if (tab === 'history') loadHistory();
+  if (tab === 'settings') loadSettings();
+}
+
+function switchChart(type, btn) {
+  chartType = type;
+  document.querySelectorAll('.chart-toggle button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  if (lastHourlyData) renderChart(lastHourlyData);
+}
+
+function fmtMoney(v) { return '$' + (v || 0).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}); }
+function fmtNum(n) {
+  n = Math.round(n || 0);
+  if (n >= 1e9) return (n/1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toString();
+}
+
+// ── CSV export ──
+function downloadCSV(filename, rows) {
+  const csv = rows.map(r => r.map(c => {
+    const s = String(c == null ? '' : c);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(',')).join('\n');
+  const blob = new Blob(['﻿' + csv], {type: 'text/csv;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+}
+function exportDashboardCSV() {
+  if (!lastHourlyData) { toast('暂无数据'); return; }
+  const rows = [['渠道ID','名称','调用次数','消费USD','实付USD','prompt_tokens','completion_tokens']];
+  Object.entries(lastHourlyData.channels).forEach(([id, c]) => {
+    rows.push([id, c.name || '', c.calls || 0, (c.usd||0).toFixed(4), (c.real_cost||0).toFixed(4), c.prompt_tokens||0, c.completion_tokens||0]);
+  });
+  downloadCSV('今日渠道_' + lastHourlyData.today_date + '.csv', rows);
+}
+function exportHistoryCSV() {
+  if (!lastHistory.length) { toast('暂无历史'); return; }
+  const rows = [['日期','调用次数','消费USD','实付USD']];
+  lastHistory.forEach(it => rows.push([it.date, it.total_calls, (it.total_usd||0).toFixed(2), (it.total_real||0).toFixed(2)]));
+  downloadCSV('历史日报.csv', rows);
+}
+
+// ── Dashboard ──
+async function loadDashboard() {
+  try {
+    const resp = await apiFetch('/api/hourly');
+    const data = await resp.json();
+    lastHourlyData = data;
+
+    document.getElementById('liveTime').textContent = data.now;
+    document.getElementById('todayReal').textContent = fmtMoney(data.today_total.total_real);
+    document.getElementById('todayUsd').textContent = fmtMoney(data.today_total.total_usd);
+    document.getElementById('todayCalls').textContent = data.today_total.total_calls.toLocaleString() + ' 次调用';
+    document.getElementById('curHourReal').textContent = fmtMoney(data.current_hour.total_real);
+    document.getElementById('curHourRange').textContent = data.current_hour.start + ' → ' + data.current_hour.end;
+
+    let totalTok = 0;
+    Object.values(data.channels).forEach(c => { totalTok += (c.prompt_tokens||0) + (c.completion_tokens||0); });
+    document.getElementById('todayTokens').textContent = fmtNum(totalTok) + ' tok';
+
+    const minutes = new Date().getHours() * 60 + new Date().getMinutes();
+    document.getElementById('perMin').textContent = fmtMoney(data.today_total.total_real / Math.max(1, minutes));
+
+    // Render chart
+    renderChart(data);
+
+    // Channel breakdown
+    const breakdown = document.getElementById('channelBreakdown');
+    const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
+    breakdown.innerHTML = '';
+    const sortedChannels = Object.entries(data.channels)
+      .map(([k,v]) => ({id:k, ...v}))
+      .sort((a,b) => (b.real_cost||0) - (a.real_cost||0));
+
+    sortedChannels.forEach((ch, i) => {
+      const row = document.createElement('div');
+      row.className = 'ch-row';
+      row.innerHTML = `
+        <div class="ch-badge" style="background:${colors[i % colors.length]}20;color:${colors[i % colors.length]}">${ch.id}</div>
+        <div class="ch-info">
+          <div class="ch-name">${ch.name || '渠道 ' + ch.id}</div>
+          <div class="ch-stats">${(ch.calls||0).toLocaleString()} 次 · ${fmtNum(ch.prompt_tokens||0)}+${fmtNum(ch.completion_tokens||0)} tok</div>
+        </div>
+        <div class="ch-amount">
+          <div class="real">${fmtMoney(ch.real_cost||0)}</div>
+          <div class="usd">消费 ${fmtMoney(ch.usd||0)}</div>
+        </div>
+      `;
+      breakdown.appendChild(row);
+    });
+  } catch(e) {
+    console.error('Dashboard error:', e);
+  }
+}
+
+function renderChart(data) {
+  const ctx = document.getElementById('hourlyChart');
+  if (!ctx) return;
+
+  const labels = data.hourly.map(h => h.hour + ':00');
+  const realValues = data.hourly.map(h => h.real_cost || 0);
+  const usdValues = data.hourly.map(h => h.usd || 0);
+
+  if (hourlyChart) hourlyChart.destroy();
+
+  const isBar = chartType === 'bar';
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const axisColor = cssVar('--text2') || '#6b7a99';
+  const gridColor = isLight ? 'rgba(15,23,42,0.06)' : 'rgba(255,255,255,0.05)';
+  const tipBg = cssVar('--card');
+  const tipBorder = cssVar('--border');
+  const tipText = cssVar('--text');
+
+  hourlyChart = new Chart(ctx, {
+    type: isBar ? 'bar' : 'line',
+    data: {
+      labels: labels,
+      datasets: [
+        {
+          label: '实付 (USD)',
+          data: realValues,
+          backgroundColor: isBar ? 'rgba(16,185,129,0.6)' : 'rgba(16,185,129,0.1)',
+          borderColor: '#10b981',
+          borderWidth: isBar ? 0 : 2,
+          borderRadius: isBar ? 4 : 0,
+          fill: !isBar,
+          tension: 0.4,
+          pointRadius: isBar ? 0 : 3,
+          pointBackgroundColor: '#10b981',
+          pointBorderColor: '#10b981',
+        },
+        {
+          label: '消费额度 (USD)',
+          data: usdValues,
+          backgroundColor: isBar ? 'rgba(59,130,246,0.4)' : 'rgba(59,130,246,0.05)',
+          borderColor: '#3b82f6',
+          borderWidth: isBar ? 0 : 1.5,
+          borderRadius: isBar ? 4 : 0,
+          fill: !isBar,
+          tension: 0.4,
+          pointRadius: isBar ? 0 : 2,
+          pointBackgroundColor: '#3b82f6',
+          pointBorderColor: '#3b82f6',
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          labels: { color: axisColor, font: { size: 11 } }
+        },
+        tooltip: {
+          backgroundColor: tipBg,
+          borderColor: tipBorder,
+          borderWidth: 1,
+          titleColor: tipText,
+          bodyColor: tipText,
+          padding: 12,
+          callbacks: {
+            label: function(ctx) {
+              return ctx.dataset.label + ': ' + fmtMoney(ctx.parsed.y);
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: gridColor },
+          ticks: { color: axisColor, font: { size: 10 } }
+        },
+        y: {
+          grid: { color: gridColor },
+          ticks: {
+            color: axisColor,
+            font: { size: 11 },
+            callback: v => '$' + v
+          }
+        }
+      }
+    }
+  });
+}
+
+// ── Channels ──
+async function loadChannels() {
+  const resp = await apiFetch('/api/channels');
+  const channels = await resp.json();
+  const tbody = document.getElementById('channelsBody');
+  tbody.innerHTML = '';
+  channels.forEach(ch => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${ch.id}</td>
+      <td><input class="name-input" value="${ch.name}" onchange="updateChannel(${ch.id}, 'name', this.value)"></td>
+      <td><input class="rate-input" type="number" step="0.001" value="${ch.rate}" onchange="updateChannel(${ch.id}, 'rate', this.value)"></td>
+      <td style="color:var(--text2)">${ch.updated_at || ''}</td>
+      <td><button class="btn btn-danger btn-sm" onclick="deleteChannel(${ch.id})">删除</button></td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+async function updateChannel(id, field, value) {
+  const body = {};
+  body[field] = field === 'rate' ? parseFloat(value) : value;
+  await apiFetch('/api/channels/' + id, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+  toast('已更新');
+  loadChannels();
+}
+
+async function deleteChannel(id) {
+  if (!confirm('确认删除渠道 ' + id + '?')) return;
+  await apiFetch('/api/channels/' + id, {method:'DELETE'});
+  toast('已删除');
+  loadChannels();
+}
+
+async function addChannel() {
+  const id = parseInt(document.getElementById('newChId').value);
+  const name = document.getElementById('newChName').value;
+  const rate = parseFloat(document.getElementById('newChRate').value);
+  if (!id) { toast('请输入渠道ID'); return; }
+  await apiFetch('/api/channels', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({id, name, rate})});
+  toast('已添加');
+  document.getElementById('newChId').value = '';
+  document.getElementById('newChName').value = '';
+  document.getElementById('newChRate').value = '';
+  loadChannels();
+}
+
+// ── History ──
+async function loadHistory() {
+  const resp = await apiFetch('/api/history');
+  const items = await resp.json();
+  lastHistory = items;
+  const list = document.getElementById('historyList');
+  list.innerHTML = '';
+  if (items.length === 0) {
+    list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text2)">暂无历史数据</div>';
+    return;
+  }
+  items.forEach(item => {
+    const li = document.createElement('li');
+    li.className = 'history-item';
+    li.onclick = () => showHistoryDetail(item.date);
+    li.innerHTML = `
+      <div>
+        <div class="history-date">${item.date}</div>
+        <div class="history-stats">${item.total_calls.toLocaleString()} 次 · 消费 ${fmtMoney(item.total_usd)}</div>
+      </div>
+      <div class="history-real">${fmtMoney(item.total_real)}</div>
+    `;
+    list.appendChild(li);
+  });
+}
+
+async function showHistoryDetail(date) {
+  const resp = await apiFetch('/api/daily/' + date);
+  const data = await resp.json();
+  let msg = `${date} 日报\n\n`;
+  Object.entries(data.channels).forEach(([id, ch]) => {
+    msg += `渠道${id} ${ch.name||''}: 实付 ${fmtMoney(ch.real_cost)} | 消费 ${fmtMoney(ch.usd)} | ${ch.calls}次\n`;
+  });
+  msg += `\n实付合计: ${fmtMoney(data.total_real)}\n消费合计: ${fmtMoney(data.total_usd)}`;
+  alert(msg);
+}
+
+// ── Settings ──
+async function loadSettings() {
+  try {
+    const resp = await apiFetch('/api/settings');
+    const d = await resp.json();
+    currentApiKey = d.api_key || '';
+    document.getElementById('apiKeyVal').value = currentApiKey;
+    renderCurl();
+  } catch(e) { console.error(e); }
+}
+function renderCurl() {
+  const origin = location.origin;
+  document.getElementById('curlBearer').textContent =
+    `curl -H "Authorization: Bearer ${currentApiKey}" \\\n     ${origin}/api/hourly`;
+  document.getElementById('curlHeader').textContent =
+    `curl -H "X-API-Key: ${currentApiKey}" \\\n     ${origin}/api/hourly`;
+}
+function copyText(id) {
+  navigator.clipboard.writeText(document.getElementById(id).textContent).then(() => toast('已复制'));
+}
+function copyApiKey() {
+  navigator.clipboard.writeText(currentApiKey).then(() => toast('已复制 API Key'));
+}
+async function regenKey() {
+  if (!confirm('重置后旧 Key 立即失效，所有使用旧 Key 的外部调用都需要更新。确认重置？')) return;
+  const resp = await apiFetch('/api/settings/regenerate-key', {method:'POST'});
+  const d = await resp.json();
+  currentApiKey = d.api_key;
+  document.getElementById('apiKeyVal').value = currentApiKey;
+  renderCurl();
+  toast('API Key 已重置');
+}
+async function changePassword(e) {
+  e.preventDefault();
+  const oldp = document.getElementById('oldPw').value;
+  const newp = document.getElementById('newPw').value;
+  // Plain fetch: 401 here means wrong old password, not an expired session.
+  const resp = await fetch('/api/settings/password', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({old_password: oldp, new_password: newp})
+  });
+  if (resp.ok) {
+    toast('密码已修改');
+    document.getElementById('oldPw').value = '';
+    document.getElementById('newPw').value = '';
+  } else {
+    const d = await resp.json().catch(() => ({}));
+    toast(d.detail || '修改失败');
+  }
+  return false;
+}
+
+// ── Init ──
+applyTheme(localStorage.getItem('theme') === 'light' ? 'light' : 'dark');
+document.getElementById('refreshSel').value = String(currentRefreshMs());
+loadDashboard();
+applyRefresh();
+</script>
+</body>
+</html>

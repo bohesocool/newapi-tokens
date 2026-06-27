@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime data (mounted volume): contains generated secrets, api key,
+# admin password hash and snapshot data — must not be committed.
+app/data/
