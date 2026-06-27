@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewAPI Monitor — settings stored here, also persisted to SQLite."""
-import os, json, sqlite3, subprocess, glob, shutil, secrets, hashlib, hmac, time
+import os, json, sqlite3, subprocess, glob, shutil, secrets, hashlib, hmac, time, urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from contextlib import contextmanager
@@ -191,6 +191,9 @@ def backfill_today_snapshots():
         if f.exists():
             continue
         raw = query_pg(int(h_start.timestamp()), int(h_end.timestamp()))
+        if raw is None:
+            print(f"[Backfill] skip {h_start.strftime('%Y-%m-%d_%H')}: pg query failed", flush=True)
+            continue
         ch_data = parse_pg_rows(raw)
         # Use rates in effect at that hour, not current rates
         rates_at = get_rates_at(h_start)
@@ -244,13 +247,19 @@ COMMIT;""".format(qpu=QUOTA_PER_USD, start=int(start_ts), end=int(end_ts))
              "-t", "-A", "-F", "|", "-v", f"tok={TOKEN_NAME}", "-c", sql],
             capture_output=True, text=True, timeout=30
         )
-        return result.stdout.strip()
     except Exception as e:
-        return ""
+        print(f"[query_pg] subprocess error: {e}", flush=True)
+        return None
+    if result.returncode != 0:
+        print(f"[query_pg] psql failed rc={result.returncode}: {result.stderr.strip()}", flush=True)
+        return None
+    return result.stdout.strip()
 
 def parse_pg_rows(raw):
     """Parse pipe-separated rows into channel dict."""
     channels = {}
+    if not raw:
+        return channels
     for line in raw.strip().split("\n"):
         line = line.strip()
         if not line:
@@ -356,6 +365,17 @@ def cleanup_daily_snapshots(date_str):
     for f in glob.glob(str(SNAPSHOT_DIR / f"{date_str}_*.json")):
         os.remove(f)
 
+def cleanup_old_snapshots(keep_days=7):
+    """Delete snapshot files whose date is older than keep_days (kept data lives in daily_history)."""
+    cutoff = (now_shanghai() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
+    for f in glob.glob(str(SNAPSHOT_DIR / "*.json")):
+        date_part = os.path.basename(f)[:10]  # YYYY-MM-DD
+        if date_part < cutoff:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
 def save_daily_history(date_str, channels, total_real, total_usd, total_calls):
     """Save daily report to SQLite history."""
     channels_json = json.dumps(
@@ -369,8 +389,8 @@ def save_daily_history(date_str, channels, total_real, total_usd, total_calls):
         """, (date_str, total_real, total_usd, total_calls, channels_json))
         conn.commit()
 
-# Run backfill after all helpers are defined
-backfill_today_snapshots()
+# Backfill + scheduler are started from the FastAPI startup event (see bottom of file),
+# so they run under `uvicorn main:app` too — not only when executed as __main__.
 
 # ── Models ──
 class ChannelUpdate(BaseModel):
@@ -393,9 +413,10 @@ def api_get_channels():
 @app.put("/api/channels/{ch_id}", dependencies=[Depends(require_auth)])
 def api_update_channel(ch_id: int, body: ChannelUpdate):
     with get_db() as conn:
-        row = conn.execute("SELECT id FROM channels WHERE id = ?", (ch_id,)).fetchone()
+        row = conn.execute("SELECT id, rate FROM channels WHERE id = ?", (ch_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Channel not found")
+        old_rate = row["rate"]
         updates = []
         params = []
         if body.name is not None:
@@ -408,6 +429,11 @@ def api_update_channel(ch_id: int, body: ChannelUpdate):
             updates.append("updated_at = datetime('now')")
             params.append(ch_id)
             conn.execute(f"UPDATE channels SET {', '.join(updates)} WHERE id = ?", params)
+            if body.rate is not None and body.rate != old_rate:
+                conn.execute(
+                    "INSERT INTO rate_history (channel_id, old_rate, new_rate, changed_at) VALUES (?, ?, ?, ?)",
+                    (ch_id, old_rate, body.rate, now_shanghai().strftime("%Y-%m-%d %H:%M:%S")),
+                )
             conn.commit()
     return {"ok": True}
 
@@ -438,6 +464,7 @@ def api_hourly():
     cur_start = now.replace(minute=0, second=0, microsecond=0)
     cur_end = now
     raw = query_pg(int(cur_start.timestamp()), int(cur_end.timestamp()))
+    pg_error = raw is None
     cur_channels = parse_pg_rows(raw)
     
     rates = get_rates()
@@ -526,6 +553,8 @@ def api_hourly():
         "channels": {str(k): v for k, v in all_channels.items()},
         "hourly": hourly,
         "rates": {str(k): v for k, v in rates.items()},
+        "today_minutes": now.hour * 60 + now.minute,
+        "error": "数据库查询失败，当前小时数据可能不准确" if pg_error else None,
     }
 
 @app.post("/api/snapshot/hourly", dependencies=[Depends(require_auth)])
@@ -535,6 +564,8 @@ def api_snapshot_hourly():
     start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
     end = start + timedelta(hours=1)
     raw = query_pg(int(start.timestamp()), int(end.timestamp()))
+    if raw is None:
+        return {"ok": False, "error": "数据库查询失败，跳过本次快照"}
     ch_data = parse_pg_rows(raw)
     # Use rates in effect at that hour
     rates_at = get_rates_at(start)
@@ -631,10 +662,22 @@ class PasswordBody(BaseModel):
     old_password: str
     new_password: str
 
+class WebhookBody(BaseModel):
+    url: Optional[str] = None
+    push_hourly: Optional[bool] = None
+    push_daily: Optional[bool] = None
+
 @app.post("/api/login")
 def api_login(body: LoginBody, request: Request):
     ip = _client_ip(request)
     now = time.time()
+    # Prune stale entries so the in-memory dict can't grow unbounded across IPs.
+    for k in list(_login_fails):
+        kept = [t for t in _login_fails[k] if now - t < LOGIN_LOCKOUT_SECS]
+        if kept:
+            _login_fails[k] = kept
+        else:
+            del _login_fails[k]
     fails = [t for t in _login_fails.get(ip, []) if now - t < LOGIN_LOCKOUT_SECS]
     if len(fails) >= LOGIN_MAX_ATTEMPTS:
         raise HTTPException(429, f"尝试次数过多，请 {LOGIN_LOCKOUT_SECS // 60} 分钟后再试")
@@ -674,6 +717,229 @@ def api_change_password(body: PasswordBody):
     set_setting("admin_password", hash_password(body.new_password))
     return {"ok": True}
 
+@app.get("/api/settings/webhook", dependencies=[Depends(require_session)])
+def api_get_webhook():
+    return {
+        "url": get_setting("webhook_url") or "",
+        "push_hourly": (get_setting("webhook_push_hourly") or "0") == "1",
+        "push_daily": (get_setting("webhook_push_daily") or "0") == "1",
+    }
+
+@app.post("/api/settings/webhook", dependencies=[Depends(require_session)])
+def api_set_webhook(body: WebhookBody):
+    if body.url is not None:
+        set_setting("webhook_url", body.url.strip())
+    if body.push_hourly is not None:
+        set_setting("webhook_push_hourly", "1" if body.push_hourly else "0")
+    if body.push_daily is not None:
+        set_setting("webhook_push_daily", "1" if body.push_daily else "0")
+    return {"ok": True}
+
+@app.post("/api/settings/webhook/test", dependencies=[Depends(require_session)])
+def api_test_webhook():
+    if not (get_setting("webhook_url") or "").strip():
+        raise HTTPException(400, "请先配置 Webhook URL")
+    ok = push_webhook("test", "✅ NewAPI Monitor Webhook 测试消息", {"hello": "world"})
+    if not ok:
+        raise HTTPException(502, "推送失败，请检查 URL 是否可达")
+    return {"ok": True}
+
+# ── Trend & rate history ──
+@app.get("/api/trend", dependencies=[Depends(require_auth)])
+def api_trend(days: int = 14, start: Optional[str] = None, end: Optional[str] = None):
+    """Per-day totals. Either last `days` days (default) or an explicit [start, end] range."""
+    today = now_shanghai().replace(hour=0, minute=0, second=0, microsecond=0)
+    if start and end:
+        try:
+            d0 = datetime.strptime(start, "%Y-%m-%d")
+            d1 = datetime.strptime(end, "%Y-%m-%d")
+        except ValueError:
+            raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+        if d1 < d0:
+            d0, d1 = d1, d0
+        date_list = []
+        cur = d0
+        while cur <= d1 and len(date_list) <= 366:
+            date_list.append(cur)
+            cur += timedelta(days=1)
+    else:
+        days = max(1, min(days, 90))
+        date_list = [today - timedelta(days=i) for i in range(days, -1, -1)]
+
+    todays = today.strftime("%Y-%m-%d")
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT date, total_real, total_usd, total_calls FROM daily_history"
+        ).fetchall()
+    hist = {r["date"]: dict(r) for r in rows}
+
+    out = []
+    for d in date_list:
+        ds = d.strftime("%Y-%m-%d")
+        if ds in hist:
+            out.append(hist[ds])
+        elif ds == todays:
+            ch, tr, tu, tc, _m = load_snapshots(today, now_shanghai())
+            out.append({"date": ds, "total_real": tr, "total_usd": tu, "total_calls": tc})
+        else:
+            out.append({"date": ds, "total_real": 0, "total_usd": 0, "total_calls": 0})
+    return out
+
+@app.get("/api/rate-history", dependencies=[Depends(require_auth)])
+def api_rate_history(limit: int = 200):
+    limit = max(1, min(limit, 1000))
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT rh.id, rh.channel_id, c.name, rh.old_rate, rh.new_rate, rh.changed_at "
+            "FROM rate_history rh LEFT JOIN channels c ON c.id = rh.channel_id "
+            "ORDER BY rh.changed_at DESC, rh.id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+# ── Report text builders & webhook push ──
+def _channel_report_lines(channels):
+    lines = ""
+    for ch_id, d in sorted(channels.items(), key=lambda x: int(x[0])):
+        usd = d.get("usd", 0) or 0
+        rate = (d.get("real_cost", 0) / usd) if usd > 0 else 0
+        name = d.get("name", "")
+        head = f"渠道 {ch_id}" + (f" ({name})" if name else "")
+        lines += f"\n\n📌 {head}（×{rate:.3f}）\n"
+        lines += f"  调用    {d.get('calls', 0):,} 次\n"
+        lines += f"  消费    ${usd:,.2f}\n"
+        lines += f"  实付    ${d.get('real_cost', 0):,.2f}\n"
+    return lines
+
+def build_hourly_report(start_dt):
+    """Build hourly report text/data from the completed-hour snapshot. Returns (None, None) if missing."""
+    f = SNAPSHOT_DIR / f"{start_dt.strftime('%Y-%m-%d')}_{start_dt.hour:02d}.json"
+    if not f.exists():
+        return None, None
+    snap = json.loads(f.read_text(encoding="utf-8"))
+    end_dt = start_dt + timedelta(hours=1)
+    rates = get_rates()
+    channels = {cid: {**d, "name": rates.get(int(cid), {}).get("name", "")}
+                for cid, d in snap.get("channels", {}).items()}
+    text = (f"📊 NewAPI 消费小时报\n━━━━━━━━━━━━━━━━━\n"
+            f"⏰ 时段: {start_dt.strftime('%m-%d %H:%M')} → {end_dt.strftime('%m-%d %H:%M')}\n"
+            f"🔑 令牌: {TOKEN_NAME}\n━━━━━━━━━━━━━━━━━")
+    text += _channel_report_lines(channels)
+    text += "\n\n━━━━━━━━━━━━━━━━━\n"
+    text += f"💎 本小时实付  ${snap.get('total_real', 0):,.2f}\n"
+    text += f"📊 本小时消费  ${snap.get('total_usd', 0):,.2f}\n"
+    text += f"📞 本小时调用  {snap.get('total_calls', 0):,} 次\n"
+    text += "━━━━━━━━━━━━━━━━━"
+    data = {"channels": snap.get("channels", {}),
+            "total_real": snap.get("total_real", 0),
+            "total_usd": snap.get("total_usd", 0),
+            "total_calls": snap.get("total_calls", 0)}
+    return text, data
+
+def build_daily_report(date_str):
+    """Build daily report text/data from snapshots, falling back to daily_history."""
+    start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=SHANGHAI)
+    channels, total_real, total_usd, total_calls, missing = load_snapshots(start, start + timedelta(days=1))
+    if not channels:
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM daily_history WHERE date = ?", (date_str,)).fetchone()
+        if row:
+            channels = json.loads(row["channels_json"]) if row["channels_json"] else {}
+            total_real, total_usd, total_calls = row["total_real"], row["total_usd"], row["total_calls"]
+            missing = []
+    rates = get_rates()
+    for cid, d in channels.items():
+        d["name"] = rates.get(int(cid), {}).get("name", "")
+    text = (f"📊 NewAPI 消费日报\n━━━━━━━━━━━━━━━━━\n"
+            f"⏰ 日期: {date_str}\n🔑 令牌: {TOKEN_NAME}\n📐 方式: 小时报叠加\n━━━━━━━━━━━━━━━━━")
+    text += _channel_report_lines(channels)
+    text += "\n\n━━━━━━━━━━━━━━━━━\n"
+    text += f"💎 实付合计  ${total_real:,.2f}\n"
+    text += f"📊 消费合计  ${total_usd:,.2f}\n"
+    text += f"📞 总调用    {total_calls:,} 次\n"
+    if missing:
+        text += f"⚠️ 缺失时段: {', '.join(missing)}\n"
+    text += "━━━━━━━━━━━━━━━━━"
+    data = {"channels": {str(k): v for k, v in channels.items()},
+            "total_real": total_real, "total_usd": total_usd,
+            "total_calls": total_calls, "missing": missing}
+    return text, data
+
+def push_webhook(report_type, text, data):
+    """POST a generic JSON payload to the configured webhook. Returns True on 2xx."""
+    url = (get_setting("webhook_url") or "").strip()
+    if not url:
+        return False
+    payload = json.dumps({
+        "type": report_type,
+        "text": text,
+        "data": data,
+        "timestamp": now_shanghai().strftime("%Y-%m-%d %H:%M:%S"),
+    }, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:
+        print(f"[webhook] push failed: {e}", flush=True)
+        return False
+
+# ── Scheduler / startup ──
+def _run_scheduler():
+    """Every full hour: save the completed hour's snapshot, push hourly report,
+    and at midnight finalize the previous day + push the daily report."""
+    while True:
+        now = now_shanghai()
+        next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        time.sleep(max(1, (next_hour - now).total_seconds() + 30))
+        try:
+            res = api_snapshot_hourly()
+            if not res.get("ok", True):
+                print(f"[Scheduler] snapshot skipped: {res.get('error')}", flush=True)
+        except Exception as e:
+            print(f"[Scheduler] snapshot error: {e}", flush=True)
+            continue
+
+        now2 = now_shanghai()
+        prev_start = now2.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        try:
+            if (get_setting("webhook_push_hourly") or "0") == "1":
+                text, d = build_hourly_report(prev_start)
+                if text:
+                    push_webhook("hourly", text, d)
+        except Exception as e:
+            print(f"[Scheduler] hourly push error: {e}", flush=True)
+
+        if now2.hour == 0:  # crossed midnight — finalize yesterday
+            try:
+                yest = (now2 - timedelta(days=1)).strftime("%Y-%m-%d")
+                start = datetime.strptime(yest, "%Y-%m-%d").replace(tzinfo=SHANGHAI)
+                ch, tr, tu, tc, _m = load_snapshots(start, start + timedelta(days=1))
+                save_daily_history(yest, ch, tr, tu, tc)
+                if (get_setting("webhook_push_daily") or "0") == "1":
+                    text, d = build_daily_report(yest)
+                    if text:
+                        push_webhook("daily", text, d)
+                cleanup_daily_snapshots(yest)
+            except Exception as e:
+                print(f"[Scheduler] daily error: {e}", flush=True)
+
+@app.on_event("startup")
+def _on_startup():
+    try:
+        backfill_today_snapshots()
+    except Exception as e:
+        print(f"[Startup] backfill error: {e}", flush=True)
+    try:
+        cleanup_old_snapshots(7)
+    except Exception as e:
+        print(f"[Startup] cleanup error: {e}", flush=True)
+    import threading
+    threading.Thread(target=_run_scheduler, daemon=True).start()
+    print("[Startup] scheduler started", flush=True)
+
 # ── Static files & main page ──
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
@@ -691,24 +957,6 @@ def index(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    import threading, time as _time
-
-    def hourly_scheduler():
-        """Auto-save snapshot at every full hour."""
-        while True:
-            now = now_shanghai()
-            # Sleep until next full hour + 30 seconds
-            next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-            wait_secs = (next_hour - now).total_seconds() + 30
-            _time.sleep(max(1, wait_secs))
-            try:
-                # Call the handler directly — no HTTP, so no auth needed.
-                result = api_snapshot_hourly()
-                print(f"[Scheduler] Snapshot saved at {now_shanghai()}: ${result.get('total_real', 0):.2f}")
-            except Exception as e:
-                print(f"[Scheduler] Snapshot failed: {e}")
-
-    t = threading.Thread(target=hourly_scheduler, daemon=True)
-    t.start()
-
+    # The hourly scheduler + backfill are launched by the FastAPI startup event,
+    # which uvicorn fires for both `python main.py` and `uvicorn main:app`.
     uvicorn.run(app, host="0.0.0.0", port=9217)

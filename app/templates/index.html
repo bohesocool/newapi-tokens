@@ -146,6 +146,7 @@ tr:hover{background:rgba(127,127,127,.04)}
 
   <!-- Dashboard Tab -->
   <div id="tab-dashboard">
+    <div id="errBanner" style="display:none;background:var(--accent4);color:#fff;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:14px"></div>
     <!-- Summary Cards -->
     <div class="grid grid-cards" style="margin-bottom:16px">
       <div class="card stat-card green">
@@ -190,6 +191,25 @@ tr:hover{background:rgba(127,127,127,.04)}
         <div id="channelBreakdown"></div>
       </div>
     </div>
+
+    <!-- Trend -->
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">
+        <span>实付趋势</span>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select class="select" id="trendDays" onchange="loadTrend()">
+            <option value="7">近 7 天</option>
+            <option value="14" selected>近 14 天</option>
+            <option value="30">近 30 天</option>
+          </select>
+          <input type="date" class="select" id="trendStart">
+          <input type="date" class="select" id="trendEnd">
+          <button class="btn btn-sm btn-ghost" onclick="loadTrendRange()">范围查询</button>
+        </div>
+      </div>
+      <canvas id="trendChart"></canvas>
+      <div id="trendSummary" class="set-hint" style="margin-top:10px"></div>
+    </div>
   </div>
 
   <!-- Channels Tab -->
@@ -208,6 +228,15 @@ tr:hover{background:rgba(127,127,127,.04)}
         <input id="newChRate" placeholder="系数" style="background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px 10px;width:80px" type="number" step="0.001">
         <button class="btn" onclick="addChannel()">添加渠道</button>
       </div>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">系数变更历史</div>
+      <table>
+        <thead>
+          <tr><th>时间</th><th>渠道</th><th>原系数</th><th>新系数</th></tr>
+        </thead>
+        <tbody id="rateHistBody"></tbody>
+      </table>
     </div>
   </div>
 
@@ -255,6 +284,22 @@ tr:hover{background:rgba(127,127,127,.04)}
           <button class="btn" type="submit">修改密码</button>
         </form>
       </div>
+
+      <!-- Webhook -->
+      <div class="set-section">
+        <div class="card-title"><span>Webhook 推送</span></div>
+        <div class="set-label">报表生成后由后端定时器自动 POST 到此 URL，通用 JSON：<code>{type, text, data, timestamp}</code>，多数接收端可直接用 <code>text</code> 字段。</div>
+        <div class="set-row">
+          <input class="key-input" id="webhookUrl" placeholder="https://...">
+          <button class="btn btn-sm" onclick="saveWebhook()">保存</button>
+          <button class="btn btn-sm btn-ghost" onclick="testWebhook()">测试推送</button>
+        </div>
+        <div class="set-row" style="margin-top:10px">
+          <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="pushHourly" onchange="saveWebhook()"> 推送小时报</label>
+          <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="pushDaily" onchange="saveWebhook()"> 推送日报</label>
+        </div>
+        <div class="set-hint">触发时机：每个整点存完快照后推送上一小时的小时报；每日 0 点归档后推送前一日日报。</div>
+      </div>
     </div>
   </div>
 </div>
@@ -269,6 +314,7 @@ let pollTimer = null;
 let lastHourlyData = null;
 let lastHistory = [];
 let currentApiKey = '';
+let trendChart = null;
 
 function toast(msg) {
   const el = document.getElementById('toast');
@@ -380,6 +426,12 @@ async function loadDashboard() {
     const data = await resp.json();
     lastHourlyData = data;
 
+    const eb = document.getElementById('errBanner');
+    if (eb) {
+      if (data.error) { eb.textContent = '⚠️ ' + data.error; eb.style.display = ''; }
+      else { eb.style.display = 'none'; }
+    }
+
     document.getElementById('liveTime').textContent = data.now;
     document.getElementById('todayReal').textContent = fmtMoney(data.today_total.total_real);
     document.getElementById('todayUsd').textContent = fmtMoney(data.today_total.total_usd);
@@ -391,7 +443,7 @@ async function loadDashboard() {
     Object.values(data.channels).forEach(c => { totalTok += (c.prompt_tokens||0) + (c.completion_tokens||0); });
     document.getElementById('todayTokens').textContent = fmtNum(totalTok) + ' tok';
 
-    const minutes = new Date().getHours() * 60 + new Date().getMinutes();
+    const minutes = (data.today_minutes != null) ? data.today_minutes : (new Date().getHours() * 60 + new Date().getMinutes());
     document.getElementById('perMin').textContent = fmtMoney(data.today_total.total_real / Math.max(1, minutes));
 
     // Render chart
@@ -505,6 +557,57 @@ function renderChart(data) {
   });
 }
 
+// ── Trend ──
+async function loadTrend() {
+  try {
+    const days = document.getElementById('trendDays').value;
+    const resp = await apiFetch('/api/trend?days=' + days);
+    renderTrend(await resp.json());
+  } catch(e) { console.error('Trend error:', e); }
+}
+async function loadTrendRange() {
+  const s = document.getElementById('trendStart').value;
+  const e = document.getElementById('trendEnd').value;
+  if (!s || !e) { toast('请选择开始和结束日期'); return; }
+  try {
+    const resp = await apiFetch('/api/trend?start=' + s + '&end=' + e);
+    renderTrend(await resp.json());
+  } catch(err) { console.error(err); toast('查询失败'); }
+}
+function renderTrend(series) {
+  const ctx = document.getElementById('trendChart');
+  if (!ctx) return;
+  const labels = series.map(d => d.date.slice(5));
+  const real = series.map(d => d.total_real || 0);
+  const usd = series.map(d => d.total_usd || 0);
+  if (trendChart) trendChart.destroy();
+  const axisColor = cssVar('--text2') || '#6b7a99';
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const gridColor = isLight ? 'rgba(15,23,42,0.06)' : 'rgba(255,255,255,0.05)';
+  trendChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [
+      { label: '实付 (USD)', data: real, borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.1)', borderWidth: 2, tension: 0.3, fill: true, pointRadius: 2 },
+      { label: '消费 (USD)', data: usd, borderColor: '#3b82f6', backgroundColor: 'rgba(59,130,246,0.05)', borderWidth: 2, tension: 0.3, fill: false, pointRadius: 2 },
+    ]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: axisColor, font: { size: 11 } } },
+        tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtMoney(c.parsed.y) } }
+      },
+      scales: {
+        x: { grid: { color: gridColor }, ticks: { color: axisColor, font: { size: 10 } } },
+        y: { grid: { color: gridColor }, ticks: { color: axisColor, callback: v => '$' + v } }
+      }
+    }
+  });
+  const tr = real.reduce((a, b) => a + b, 0), tu = usd.reduce((a, b) => a + b, 0);
+  document.getElementById('trendSummary').textContent =
+    `区间合计：实付 ${fmtMoney(tr)} · 消费 ${fmtMoney(tu)} · 共 ${series.length} 天`;
+}
+
 // ── Channels ──
 async function loadChannels() {
   const resp = await apiFetch('/api/channels');
@@ -522,6 +625,31 @@ async function loadChannels() {
     `;
     tbody.appendChild(tr);
   });
+  loadRateHistory();
+}
+
+async function loadRateHistory() {
+  try {
+    const resp = await apiFetch('/api/rate-history?limit=100');
+    const items = await resp.json();
+    const tb = document.getElementById('rateHistBody');
+    if (!tb) return;
+    tb.innerHTML = '';
+    if (!items.length) {
+      tb.innerHTML = '<tr><td colspan="4" style="color:var(--text2)">暂无变更记录</td></tr>';
+      return;
+    }
+    items.forEach(it => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td style="color:var(--text2)">${it.changed_at}</td>
+        <td>${it.channel_id} ${it.name || ''}</td>
+        <td>${it.old_rate}</td>
+        <td style="color:var(--accent2)">${it.new_rate}</td>
+      `;
+      tb.appendChild(tr);
+    });
+  } catch(e) { console.error('Rate history error:', e); }
 }
 
 async function updateChannel(id, field, value) {
@@ -597,6 +725,7 @@ async function loadSettings() {
     currentApiKey = d.api_key || '';
     document.getElementById('apiKeyVal').value = currentApiKey;
     renderCurl();
+    loadWebhook();
   } catch(e) { console.error(e); }
 }
 function renderCurl() {
@@ -641,10 +770,40 @@ async function changePassword(e) {
   return false;
 }
 
+// ── Webhook ──
+async function loadWebhook() {
+  try {
+    const resp = await apiFetch('/api/settings/webhook');
+    const d = await resp.json();
+    document.getElementById('webhookUrl').value = d.url || '';
+    document.getElementById('pushHourly').checked = !!d.push_hourly;
+    document.getElementById('pushDaily').checked = !!d.push_daily;
+  } catch(e) { console.error('Webhook load error:', e); }
+}
+async function saveWebhook() {
+  const body = {
+    url: document.getElementById('webhookUrl').value,
+    push_hourly: document.getElementById('pushHourly').checked,
+    push_daily: document.getElementById('pushDaily').checked,
+  };
+  try {
+    await apiFetch('/api/settings/webhook', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    toast('Webhook 已保存');
+  } catch(e) { toast('保存失败'); }
+}
+async function testWebhook() {
+  try {
+    const r = await fetch('/api/settings/webhook/test', {method:'POST'});
+    if (r.ok) { toast('测试推送成功'); }
+    else { const d = await r.json().catch(() => ({})); toast(d.detail || '测试失败'); }
+  } catch(e) { toast('测试失败'); }
+}
+
 // ── Init ──
 applyTheme(localStorage.getItem('theme') === 'light' ? 'light' : 'dark');
 document.getElementById('refreshSel').value = String(currentRefreshMs());
 loadDashboard();
+loadTrend();
 applyRefresh();
 </script>
 </body>
