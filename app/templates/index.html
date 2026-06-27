@@ -432,7 +432,6 @@ function renderChart(data) {
 
   const labels = data.hourly.map(h => h.hour + ':00');
   const realValues = data.hourly.map(h => h.real_cost || 0);
-  const usdValues = data.hourly.map(h => h.usd || 0);
 
   if (hourlyChart) hourlyChart.destroy();
 
@@ -461,19 +460,6 @@ function renderChart(data) {
           pointRadius: isBar ? 0 : 3,
           pointBackgroundColor: '#10b981',
           pointBorderColor: '#10b981',
-        },
-        {
-          label: '消费额度 (USD)',
-          data: usdValues,
-          backgroundColor: isBar ? 'rgba(59,130,246,0.4)' : 'rgba(59,130,246,0.05)',
-          borderColor: '#3b82f6',
-          borderWidth: isBar ? 0 : 1.5,
-          borderRadius: isBar ? 4 : 0,
-          fill: !isBar,
-          tension: 0.4,
-          pointRadius: isBar ? 0 : 2,
-          pointBackgroundColor: '#3b82f6',
-          pointBorderColor: '#3b82f6',
         }
       ]
     },
