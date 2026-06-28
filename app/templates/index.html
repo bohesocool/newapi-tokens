@@ -54,6 +54,8 @@ body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-h
 .stat-card.blue .stat-value{color:var(--accent)}
 .stat-card.amber .stat-value{color:var(--accent3)}
 .stat-card.red .stat-value{color:var(--accent4)}
+.usage-bar{height:6px;border-radius:4px;background:var(--bg);margin-top:12px;overflow:hidden}
+.usage-fill{height:100%;width:0;border-radius:4px;background:var(--accent);transition:width .5s ease,background .5s ease}
 
 /* Chart toggle */
 .chart-toggle{display:flex;gap:2px;background:var(--bg);border-radius:6px;padding:2px}
@@ -199,6 +201,21 @@ tr:hover{background:rgba(127,127,127,.04)}
         <div class="stat-label">今日每分钟均额</div>
         <div class="stat-value" id="perMin">$0.00</div>
         <div class="stat-label">/min</div>
+      </div>
+    </div>
+
+    <!-- Server Load -->
+    <div class="grid grid-cards" style="margin-bottom:16px">
+      <div class="card stat-card blue">
+        <div class="stat-label">服务器 CPU</div>
+        <div class="stat-value" id="sysCpu">--%</div>
+        <div class="usage-bar"><div class="usage-fill" id="sysCpuBar"></div></div>
+      </div>
+      <div class="card stat-card green">
+        <div class="stat-label">服务器内存</div>
+        <div class="stat-value" id="sysMem">--%</div>
+        <div class="stat-label" id="sysMemDetail">-- / --</div>
+        <div class="usage-bar"><div class="usage-fill" id="sysMemBar"></div></div>
       </div>
     </div>
 
@@ -401,7 +418,7 @@ function currentRefreshMs() {
 function applyRefresh() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   const ms = currentRefreshMs();
-  if (ms > 0) pollTimer = setInterval(() => { loadDashboard(); loadChannelStatus(); }, ms);
+  if (ms > 0) pollTimer = setInterval(() => { loadDashboard(); loadChannelStatus(); loadSystem(); }, ms);
 }
 function changeRefresh() {
   localStorage.setItem('refreshMs', document.getElementById('refreshSel').value);
@@ -437,6 +454,32 @@ function fmtNum(n) {
   if (n >= 1e6) return (n/1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
   return n.toString();
+}
+function fmtGB(bytes) { return (bytes / 1073741824).toFixed(1) + ' GB'; }
+
+function usageColor(pct) {
+  if (pct >= 90) return 'var(--accent4)';
+  if (pct >= 70) return 'var(--accent3)';
+  return 'var(--accent2)';
+}
+
+async function loadSystem() {
+  try {
+    const resp = await apiFetch('/api/system');
+    const d = await resp.json();
+    const cpu = document.getElementById('sysCpu');
+    const cpuBar = document.getElementById('sysCpuBar');
+    cpu.textContent = d.cpu_percent + '%';
+    cpuBar.style.width = Math.min(100, d.cpu_percent) + '%';
+    cpuBar.style.background = usageColor(d.cpu_percent);
+
+    const mem = document.getElementById('sysMem');
+    const memBar = document.getElementById('sysMemBar');
+    mem.textContent = d.mem_percent + '%';
+    document.getElementById('sysMemDetail').textContent = fmtGB(d.mem_used) + ' / ' + fmtGB(d.mem_total);
+    memBar.style.width = Math.min(100, d.mem_percent) + '%';
+    memBar.style.background = usageColor(d.mem_percent);
+  } catch (e) { /* keep last values on transient errors */ }
 }
 
 // ── CSV export ──
@@ -975,6 +1018,7 @@ applyTheme(localStorage.getItem('theme') === 'light' ? 'light' : 'dark');
 document.getElementById('refreshSel').value = String(currentRefreshMs());
 loadDashboard();
 loadChannelStatus();
+loadSystem();
 loadTrend();
 applyRefresh();
 </script>

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """NewAPI Monitor — settings stored here, also persisted to SQLite."""
 import os, json, sqlite3, glob, secrets, hashlib, hmac, time, urllib.request
+import psutil
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from contextlib import contextmanager
@@ -775,6 +776,18 @@ def api_get_snapshot(date_str: str, hour: int):
 @app.get("/api/health")
 def api_health():
     return {"status": "ok", "time": now_shanghai().strftime("%Y-%m-%d %H:%M:%S")}
+
+@app.get("/api/system", dependencies=[Depends(require_auth)])
+def api_system():
+    # Inside the container psutil reads /proc, which on Linux reflects the host
+    # machine's CPU/memory — i.e. the server's overall load.
+    vm = psutil.virtual_memory()
+    return {
+        "cpu_percent": round(psutil.cpu_percent(interval=0.3), 1),
+        "mem_percent": round(vm.percent, 1),
+        "mem_used": vm.used,
+        "mem_total": vm.total,
+    }
 
 # ── Auth & Settings ──
 class LoginBody(BaseModel):
