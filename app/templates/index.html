@@ -88,6 +88,22 @@ tr:hover{background:rgba(127,127,127,.04)}
 .ch-amount .real{font-size:18px;font-weight:700;color:var(--accent2)}
 .ch-amount .usd{font-size:12px;color:var(--text2)}
 
+/* Channel status monitor (per-minute heat strip) */
+.cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
+.cs-card{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:12px}
+.cs-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.cs-badge{width:26px;height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;min-width:26px}
+.cs-name{flex:1;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cs-pct{font-size:12px;font-weight:600;color:var(--text2)}
+.cs-cells{display:flex;flex-wrap:wrap;gap:2px}
+.cs-cell{width:10px;height:10px;border-radius:2px;background:rgba(127,127,127,.10);cursor:default}
+.cs-cell.green{background:var(--accent2)}
+.cs-cell.yellow{background:var(--accent3)}
+.cs-cell.red{background:var(--accent4)}
+.cs-legend{display:flex;gap:12px;align-items:center;font-size:11px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--text2)}
+.cs-legend span{display:flex;align-items:center;gap:4px}
+.cs-legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+
 /* Tabs */
 .tabs{display:flex;gap:4px;margin-bottom:20px;background:var(--card);border-radius:var(--radius);padding:4px;width:fit-content;flex-wrap:wrap}
 .tab{padding:8px 20px;font-size:14px;font-weight:500;color:var(--text2);cursor:pointer;border-radius:8px;transition:all .15s}
@@ -190,6 +206,20 @@ tr:hover{background:rgba(127,127,127,.04)}
         </div>
         <div id="channelBreakdown"></div>
       </div>
+    </div>
+
+    <!-- Channel status monitor -->
+    <div class="card" style="margin-top:16px">
+      <div class="card-title">
+        <span>渠道状态监控 (近 60 分钟 · 每格 1 分钟)</span>
+        <div class="cs-legend">
+          <span><i style="background:var(--accent2)"></i>≥95%</span>
+          <span><i style="background:var(--accent3)"></i>90–95%</span>
+          <span><i style="background:var(--accent4)"></i>&lt;90%</span>
+          <span><i style="background:rgba(127,127,127,.10)"></i>无请求</span>
+        </div>
+      </div>
+      <div id="channelStatus"></div>
     </div>
 
     <!-- Trend -->
@@ -356,7 +386,7 @@ function currentRefreshMs() {
 function applyRefresh() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   const ms = currentRefreshMs();
-  if (ms > 0) pollTimer = setInterval(loadDashboard, ms);
+  if (ms > 0) pollTimer = setInterval(() => { loadDashboard(); loadChannelStatus(); }, ms);
 }
 function changeRefresh() {
   localStorage.setItem('refreshMs', document.getElementById('refreshSel').value);
@@ -612,6 +642,61 @@ function renderTrend(series) {
     `区间合计：实付 ${fmtMoney(tr)} · 共 ${series.length} 天`;
 }
 
+// ── Channel status monitor ──
+async function loadChannelStatus() {
+  try {
+    const resp = await apiFetch('/api/channel-status?minutes=60');
+    renderChannelStatus(await resp.json());
+  } catch(e) { console.error('Channel status error:', e); }
+}
+function renderChannelStatus(data) {
+  const wrap = document.getElementById('channelStatus');
+  if (!wrap) return;
+  const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
+  if (data.error) {
+    wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">数据库查询失败，暂无渠道状态</div>';
+    return;
+  }
+  const ids = Object.keys(data.channels).sort((a, b) => a - b);
+  if (!ids.length) {
+    wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">暂无渠道</div>';
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'cs-cards';
+  ids.forEach((id, i) => {
+    const ch = data.channels[id];
+    let s = 0, t = 0;
+    const cellsHtml = ch.cells.map(c => {
+      s += c.success; t += c.total;
+      let cls, tip;
+      if (c.rate === null || c.total === 0) {
+        cls = ''; tip = `${c.t}\n无请求`;
+      } else {
+        const r = c.rate * 100;
+        cls = r >= 95 ? 'green' : (r >= 90 ? 'yellow' : 'red');
+        tip = `${c.t}\n正确率 ${r.toFixed(1)}% (${c.success}/${c.total})`;
+      }
+      return `<div class="cs-cell ${cls}" title="${tip}"></div>`;
+    }).join('');
+    const pct = t > 0 ? (s / t * 100) : null;
+    const pctColor = pct === null ? 'var(--text2)' : (pct >= 95 ? 'var(--accent2)' : (pct >= 90 ? 'var(--accent3)' : 'var(--accent4)'));
+    const c = colors[i % colors.length];
+    const card = document.createElement('div');
+    card.className = 'cs-card';
+    card.innerHTML = `
+      <div class="cs-head">
+        <span class="cs-badge" style="background:${c}20;color:${c}">${id}</span>
+        <span class="cs-name">${ch.name || '渠道 ' + id}</span>
+        <span class="cs-pct" style="color:${pctColor}">${pct === null ? '—' : pct.toFixed(1) + '%'}</span>
+      </div>
+      <div class="cs-cells">${cellsHtml}</div>`;
+    grid.appendChild(card);
+  });
+  wrap.innerHTML = '';
+  wrap.appendChild(grid);
+}
+
 // ── Channels ──
 async function loadChannels() {
   const resp = await apiFetch('/api/channels');
@@ -809,6 +894,7 @@ async function testWebhook() {
 applyTheme(localStorage.getItem('theme') === 'light' ? 'light' : 'dark');
 document.getElementById('refreshSel').value = String(currentRefreshMs());
 loadDashboard();
+loadChannelStatus();
 loadTrend();
 applyRefresh();
 </script>

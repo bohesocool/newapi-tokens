@@ -325,10 +325,53 @@ COMMIT;""".format(tok=safe_tok, start=int(start_ts), end=int(end_ts))
             continue
         rows[int(parts[0])] = {"success": int(parts[1]), "errors": int(parts[2])}
     return rows
-    """Get channel rates from DB."""
-    with get_db() as conn:
-        rows = conn.execute("SELECT id, name, rate FROM channels ORDER BY id").fetchall()
-        return {r["id"]: {"name": r["name"], "rate": r["rate"]} for r in rows}
+
+def query_pg_minute_status(start_ts, end_ts):
+    """Per-channel, per-minute success(type=2)/error(type=5) counts for the token in
+    [start, end). Groups by channel_id and the minute bucket (created_at/60), so a single
+    indexed query yields one row per (channel, minute). Returns dict or None on failure:
+        {channel_id: {minute_bucket: {"success": n, "errors": n}}}"""
+    safe_tok = TOKEN_NAME.replace("'", "''")
+    sql = """BEGIN READ ONLY;
+SELECT
+  channel_id,
+  created_at / 60 AS m,
+  count(*) FILTER (WHERE type = 2),
+  count(*) FILTER (WHERE type = 5)
+FROM logs
+WHERE type IN (2, 5)
+  AND token_name = '{tok}'
+  AND created_at >= {start}
+  AND created_at < {end}
+GROUP BY channel_id, m
+ORDER BY channel_id, m;
+COMMIT;""".format(tok=safe_tok, start=int(start_ts), end=int(end_ts))
+    try:
+        result = subprocess.run(
+            ["/usr/bin/docker", "exec", PG_CONTAINER, "psql",
+             "-U", PG_USER, "-d", PG_DB,
+             "-t", "-A", "-F", "|", "-c", sql],
+            capture_output=True, text=True, timeout=30
+        )
+    except Exception as e:
+        print(f"[query_pg_minute_status] subprocess error: {e}", flush=True)
+        return None
+    if result.returncode != 0:
+        print(f"[query_pg_minute_status] psql failed rc={result.returncode}: {result.stderr.strip()}", flush=True)
+        return None
+    out = {}
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < 4:
+            continue
+        ch_id = int(parts[0])
+        out.setdefault(ch_id, {})[int(parts[1])] = {
+            "success": int(parts[2]), "errors": int(parts[3])
+        }
+    return out
 
 def now_shanghai():
     return datetime.now(SHANGHAI)
@@ -613,6 +656,42 @@ def api_hourly():
         "today_minutes": now.hour * 60 + now.minute,
         "error": "数据库查询失败，当前小时数据可能不准确" if pg_error else None,
     }
+
+@app.get("/api/channel-status", dependencies=[Depends(require_auth)])
+def api_channel_status(minutes: int = 60):
+    """Per-channel, per-minute success-rate strip for the last `minutes` minutes.
+    The newest cell is the in-progress current minute. Each cell carries the minute's
+    success rate, or rate=None when that minute had no requests (rendered transparent)."""
+    minutes = max(5, min(minutes, 240))
+    now = now_shanghai()
+    cur_min = now.replace(second=0, microsecond=0)
+    first_min = cur_min - timedelta(minutes=minutes - 1)
+    start_ts = int(first_min.timestamp())
+    end_ts = int((cur_min + timedelta(minutes=1)).timestamp())  # exclusive; includes current minute
+    data = query_pg_minute_status(start_ts, end_ts)
+    rates = get_rates()
+    if data is None:
+        return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
+                "channels": {}, "error": True}
+    bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
+    bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
+    bucket_lbl = [b.strftime("%m-%d %H:%M") for b in bucket_dts]
+    all_ids = sorted(set(rates.keys()) | set(data.keys()))
+    channels = {}
+    for ch_id in all_ids:
+        chd = data.get(ch_id, {})
+        cells = []
+        for bi, lbl in zip(bucket_idx, bucket_lbl):
+            c = chd.get(bi)
+            if c:
+                total = c["success"] + c["errors"]
+                cells.append({"t": lbl, "success": c["success"], "errors": c["errors"],
+                              "total": total, "rate": (c["success"] / total) if total else None})
+            else:
+                cells.append({"t": lbl, "success": 0, "errors": 0, "total": 0, "rate": None})
+        channels[str(ch_id)] = {"name": rates.get(ch_id, {}).get("name", ""), "cells": cells}
+    return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
+            "channels": channels, "error": False}
 
 @app.post("/api/snapshot/hourly", dependencies=[Depends(require_auth)])
 def api_snapshot_hourly():
