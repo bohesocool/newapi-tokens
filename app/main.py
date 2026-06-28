@@ -227,8 +227,9 @@ def fmt_num(n):
 def query_pg(start_ts, end_ts):
     """Query NewAPI PostgreSQL for token usage. Single query returns per-channel
     success(type=2) aggregates plus error(type=5) count via FILTER — uses idx_created_at_type."""
-    # token_name passed as a psql variable (:'tok') so it is safely quoted;
-    # start/end are coerced to int, QUOTA_PER_USD is an internal constant.
+    # token_name is single-quote-escaped to prevent SQL injection (psql -c does
+    # not interpolate :'var'); start/end are coerced to int, QUOTA_PER_USD is internal.
+    safe_tok = TOKEN_NAME.replace("'", "''")
     sql = """BEGIN READ ONLY;
 SELECT
   channel_id,
@@ -240,17 +241,17 @@ SELECT
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = :'tok'
+  AND token_name = '{tok}'
   AND created_at >= {start}
   AND created_at < {end}
 GROUP BY channel_id
 ORDER BY channel_id;
-COMMIT;""".format(qpu=QUOTA_PER_USD, start=int(start_ts), end=int(end_ts))
+COMMIT;""".format(qpu=QUOTA_PER_USD, tok=safe_tok, start=int(start_ts), end=int(end_ts))
     try:
         result = subprocess.run(
             ["/usr/bin/docker", "exec", PG_CONTAINER, "psql",
              "-U", PG_USER, "-d", PG_DB,
-             "-t", "-A", "-F", "|", "-v", f"tok={TOKEN_NAME}", "-c", sql],
+             "-t", "-A", "-F", "|", "-c", sql],
             capture_output=True, text=True, timeout=30
         )
     except Exception as e:
@@ -287,6 +288,7 @@ def parse_pg_rows(raw):
 def query_pg_error_rates(start_ts, end_ts):
     """Per-channel success(type=2)/error(type=5) counts for the token in [start, end).
     Single aggregated query — uses the idx_created_at_type index, scans only ~1 min of rows."""
+    safe_tok = TOKEN_NAME.replace("'", "''")
     sql = """BEGIN READ ONLY;
 SELECT
   channel_id,
@@ -294,17 +296,17 @@ SELECT
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = :'tok'
+  AND token_name = '{tok}'
   AND created_at >= {start}
   AND created_at < {end}
 GROUP BY channel_id
 ORDER BY channel_id;
-COMMIT;""".format(start=int(start_ts), end=int(end_ts))
+COMMIT;""".format(tok=safe_tok, start=int(start_ts), end=int(end_ts))
     try:
         result = subprocess.run(
             ["/usr/bin/docker", "exec", PG_CONTAINER, "psql",
              "-U", PG_USER, "-d", PG_DB,
-             "-t", "-A", "-F", "|", "-v", f"tok={TOKEN_NAME}", "-c", sql],
+             "-t", "-A", "-F", "|", "-c", sql],
             capture_output=True, text=True, timeout=30
         )
     except Exception as e:
