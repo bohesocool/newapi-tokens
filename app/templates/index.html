@@ -375,6 +375,8 @@ const API = '';
 let hourlyChart = null;
 let chartType = 'bar';
 let pollTimer = null;
+let sysTimer = null;
+const SYS_REFRESH_MS = 2000;  // CPU/内存独立快速刷新，接近实时
 let lastHourlyData = null;
 let lastHistory = [];
 let currentApiKey = '';
@@ -417,8 +419,12 @@ function currentRefreshMs() {
 }
 function applyRefresh() {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (sysTimer) { clearInterval(sysTimer); sysTimer = null; }
   const ms = currentRefreshMs();
-  if (ms > 0) pollTimer = setInterval(() => { loadDashboard(); loadChannelStatus(); loadSystem(); }, ms);
+  if (ms > 0) {
+    pollTimer = setInterval(() => { loadDashboard(); loadChannelStatus(); }, ms);
+    sysTimer = setInterval(loadSystem, SYS_REFRESH_MS);
+  }
 }
 function changeRefresh() {
   localStorage.setItem('refreshMs', document.getElementById('refreshSel').value);
