@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewAPI Monitor — settings stored here, also persisted to SQLite."""
-import os, json, sqlite3, subprocess, glob, shutil, secrets, hashlib, hmac, time, urllib.request
+import os, json, sqlite3, glob, secrets, hashlib, hmac, time, urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from contextlib import contextmanager
@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from pydantic import BaseModel
 from typing import Optional
+from psycopg_pool import ConnectionPool
 
 # ── Config ──
 SHANGHAI = timezone(timedelta(hours=8))
@@ -21,12 +22,51 @@ SNAPSHOT_DIR = BASE_DIR / "data" / "hourly_snapshots"
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-# PostgreSQL access via docker exec
-PG_CONTAINER = os.environ.get("PG_CONTAINER", "postgres")
+# PostgreSQL direct access via psycopg (read-only pool over the docker network).
+PG_HOST = os.environ.get("PG_HOST", "postgres")
+PG_PORT = os.environ.get("PG_PORT", "5432")
 PG_USER = os.environ.get("PG_USER", "root")
 PG_DB = os.environ.get("PG_DB", "new-api")
+PG_PASSWORD = os.environ.get("PG_PASSWORD", "")
 TOKEN_NAME = os.environ.get("TOKEN_NAME", "ducker")
 QUOTA_PER_USD = 500000
+
+PG_CONNINFO = (
+    f"host={PG_HOST} port={PG_PORT} user={PG_USER} dbname={PG_DB} "
+    f"password={PG_PASSWORD} connect_timeout=10"
+)
+# Pool opened at startup. Every session is forced read-only + statement_timeout at
+# the SERVER level, so the monitor can never write to the NewAPI database.
+_pg_pool = ConnectionPool(
+    PG_CONNINFO,
+    min_size=1,
+    max_size=4,
+    open=False,
+    kwargs={"options": "-c default_transaction_read_only=on -c statement_timeout=30000"},
+)
+
+def _pg_rows(sql, params=()):
+    """Run a read-only SELECT via the pool. Returns list of row tuples, or None on failure."""
+    try:
+        with _pg_pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                return cur.fetchall()
+    except Exception as e:
+        print(f"[pg] query failed: {e}", flush=True)
+        return None
+
+# Short-TTL cache so concurrent dashboard polls collapse into one PG query.
+DASH_CACHE_TTL = 10  # seconds
+_resp_cache = {}  # key -> (expires_ts, value)
+
+def cached_response(key, ttl, producer):
+    hit = _resp_cache.get(key)
+    if hit and hit[0] > time.time():
+        return hit[1]
+    val = producer()
+    _resp_cache[key] = (time.time() + ttl, val)
+    return val
 
 # 渠道错误率监控（可按需调整）
 ERROR_RATE_THRESHOLD = 0.10   # 错误率 ≥ 10% 触发告警
@@ -225,114 +265,70 @@ def fmt_num(n):
     return str(n)
 
 def query_pg(start_ts, end_ts):
-    """Query NewAPI PostgreSQL for token usage. Single query returns per-channel
-    success(type=2) aggregates plus error(type=5) count via FILTER — uses idx_created_at_type."""
-    # token_name is single-quote-escaped to prevent SQL injection (psql -c does
-    # not interpolate :'var'); start/end are coerced to int, QUOTA_PER_USD is internal.
-    safe_tok = TOKEN_NAME.replace("'", "''")
-    sql = """BEGIN READ ONLY;
+    """Per-channel success(type=2) aggregates plus error(type=5) count for the token in
+    [start, end). Read-only single query — uses idx_created_at_type. Returns rows or None.
+    token_name/start/end are passed as real query parameters (no string interpolation)."""
+    sql = """
 SELECT
   channel_id,
   count(*) FILTER (WHERE type = 2),
   COALESCE(sum(quota) FILTER (WHERE type = 2), 0),
-  round(COALESCE(sum(quota) FILTER (WHERE type = 2), 0)::numeric / {qpu}, 4),
+  round(COALESCE(sum(quota) FILTER (WHERE type = 2), 0)::numeric / %s, 4),
   COALESCE(sum(prompt_tokens) FILTER (WHERE type = 2), 0),
   COALESCE(sum(completion_tokens) FILTER (WHERE type = 2), 0),
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = '{tok}'
-  AND created_at >= {start}
-  AND created_at < {end}
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s
 GROUP BY channel_id
-ORDER BY channel_id;
-COMMIT;""".format(qpu=QUOTA_PER_USD, tok=safe_tok, start=int(start_ts), end=int(end_ts))
-    try:
-        result = subprocess.run(
-            ["/usr/bin/docker", "exec", PG_CONTAINER, "psql",
-             "-U", PG_USER, "-d", PG_DB,
-             "-t", "-A", "-F", "|", "-c", sql],
-            capture_output=True, text=True, timeout=30
-        )
-    except Exception as e:
-        print(f"[query_pg] subprocess error: {e}", flush=True)
-        return None
-    if result.returncode != 0:
-        print(f"[query_pg] psql failed rc={result.returncode}: {result.stderr.strip()}", flush=True)
-        return None
-    return result.stdout.strip()
+ORDER BY channel_id"""
+    return _pg_rows(sql, (QUOTA_PER_USD, TOKEN_NAME, int(start_ts), int(end_ts)))
 
-def parse_pg_rows(raw):
-    """Parse pipe-separated rows into channel dict."""
+def parse_pg_rows(rows):
+    """Parse query_pg result rows into a channel dict."""
     channels = {}
-    if not raw:
+    if not rows:
         return channels
-    for line in raw.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("|")
-        if len(parts) < 7:
-            continue
-        ch_id = int(parts[0])
+    for r in rows:
+        ch_id = int(r[0])
         channels[ch_id] = {
-            "calls": int(parts[1]),
-            "quota": int(parts[2]),
-            "usd": float(parts[3]),
-            "prompt_tokens": int(parts[4]),
-            "completion_tokens": int(parts[5]),
-            "errors": int(parts[6]),
+            "calls": int(r[1]),
+            "quota": int(r[2]),
+            "usd": float(r[3]),
+            "prompt_tokens": int(r[4]),
+            "completion_tokens": int(r[5]),
+            "errors": int(r[6]),
         }
     return channels
 
 def query_pg_error_rates(start_ts, end_ts):
     """Per-channel success(type=2)/error(type=5) counts for the token in [start, end).
-    Single aggregated query — uses the idx_created_at_type index, scans only ~1 min of rows."""
-    safe_tok = TOKEN_NAME.replace("'", "''")
-    sql = """BEGIN READ ONLY;
+    Read-only single aggregated query — uses idx_created_at_type. Returns dict or None."""
+    sql = """
 SELECT
   channel_id,
   count(*) FILTER (WHERE type = 2),
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = '{tok}'
-  AND created_at >= {start}
-  AND created_at < {end}
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s
 GROUP BY channel_id
-ORDER BY channel_id;
-COMMIT;""".format(tok=safe_tok, start=int(start_ts), end=int(end_ts))
-    try:
-        result = subprocess.run(
-            ["/usr/bin/docker", "exec", PG_CONTAINER, "psql",
-             "-U", PG_USER, "-d", PG_DB,
-             "-t", "-A", "-F", "|", "-c", sql],
-            capture_output=True, text=True, timeout=30
-        )
-    except Exception as e:
-        print(f"[query_pg_error_rates] subprocess error: {e}", flush=True)
+ORDER BY channel_id"""
+    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    if rows is None:
         return None
-    if result.returncode != 0:
-        print(f"[query_pg_error_rates] psql failed rc={result.returncode}: {result.stderr.strip()}", flush=True)
-        return None
-    rows = {}
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("|")
-        if len(parts) < 3:
-            continue
-        rows[int(parts[0])] = {"success": int(parts[1]), "errors": int(parts[2])}
-    return rows
+    return {int(r[0]): {"success": int(r[1]), "errors": int(r[2])} for r in rows}
 
 def query_pg_minute_status(start_ts, end_ts):
     """Per-channel, per-minute success(type=2)/error(type=5) counts for the token in
     [start, end). Groups by channel_id and the minute bucket (created_at/60), so a single
-    indexed query yields one row per (channel, minute). Returns dict or None on failure:
+    indexed read-only query yields one row per (channel, minute). Returns dict or None:
         {channel_id: {minute_bucket: {"success": n, "errors": n}}}"""
-    safe_tok = TOKEN_NAME.replace("'", "''")
-    sql = """BEGIN READ ONLY;
+    sql = """
 SELECT
   channel_id,
   created_at / 60 AS m,
@@ -340,36 +336,18 @@ SELECT
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = '{tok}'
-  AND created_at >= {start}
-  AND created_at < {end}
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s
 GROUP BY channel_id, m
-ORDER BY channel_id, m;
-COMMIT;""".format(tok=safe_tok, start=int(start_ts), end=int(end_ts))
-    try:
-        result = subprocess.run(
-            ["/usr/bin/docker", "exec", PG_CONTAINER, "psql",
-             "-U", PG_USER, "-d", PG_DB,
-             "-t", "-A", "-F", "|", "-c", sql],
-            capture_output=True, text=True, timeout=30
-        )
-    except Exception as e:
-        print(f"[query_pg_minute_status] subprocess error: {e}", flush=True)
-        return None
-    if result.returncode != 0:
-        print(f"[query_pg_minute_status] psql failed rc={result.returncode}: {result.stderr.strip()}", flush=True)
+ORDER BY channel_id, m"""
+    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    if rows is None:
         return None
     out = {}
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        parts = line.split("|")
-        if len(parts) < 4:
-            continue
-        ch_id = int(parts[0])
-        out.setdefault(ch_id, {})[int(parts[1])] = {
-            "success": int(parts[2]), "errors": int(parts[3])
+    for r in rows:
+        out.setdefault(int(r[0]), {})[int(r[1])] = {
+            "success": int(r[2]), "errors": int(r[3]),
         }
     return out
 
@@ -556,7 +534,10 @@ def api_delete_channel(ch_id: int):
 
 @app.get("/api/hourly", dependencies=[Depends(require_auth)])
 def api_hourly():
-    """Get current hour data (live query) + save snapshot for previous completed hour."""
+    """Get current hour data (live query). Cached briefly so concurrent polls share one query."""
+    return cached_response("hourly", DASH_CACHE_TTL, _compute_hourly)
+
+def _compute_hourly():
     now = now_shanghai()
     
     # Current hour (in-progress)
@@ -663,6 +644,10 @@ def api_channel_status(minutes: int = 60):
     The newest cell is the in-progress current minute. Each cell carries the minute's
     success rate, or rate=None when that minute had no requests (rendered transparent)."""
     minutes = max(5, min(minutes, 240))
+    return cached_response(f"chstatus:{minutes}", DASH_CACHE_TTL,
+                           lambda: _compute_channel_status(minutes))
+
+def _compute_channel_status(minutes):
     now = now_shanghai()
     cur_min = now.replace(second=0, microsecond=0)
     first_min = cur_min - timedelta(minutes=minutes - 1)
@@ -1133,6 +1118,10 @@ def _run_error_monitor():
 
 @app.on_event("startup")
 def _on_startup():
+    try:
+        _pg_pool.open()
+    except Exception as e:
+        print(f"[Startup] pg pool open error: {e}", flush=True)
     try:
         backfill_today_snapshots()
     except Exception as e:

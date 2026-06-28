@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir fastapi uvicorn[standard] pydantic itsdangerous
+RUN pip install --no-cache-dir fastapi uvicorn[standard] pydantic itsdangerous "psycopg[binary]" psycopg-pool
 
 COPY app/ /app/
 

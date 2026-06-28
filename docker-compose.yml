@@ -7,8 +7,6 @@ services:
       - "9217:9217"
     volumes:
       - ./app/data:/app/data
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - /usr/bin/docker:/usr/bin/docker:ro
     env_file:
       - .env
     networks:
