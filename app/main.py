@@ -689,7 +689,8 @@ def api_channel_status(minutes: int = 60):
                               "total": total, "rate": (c["success"] / total) if total else None})
             else:
                 cells.append({"t": lbl, "success": 0, "errors": 0, "total": 0, "rate": None})
-        channels[str(ch_id)] = {"name": rates.get(ch_id, {}).get("name", ""), "cells": cells}
+        channels[str(ch_id)] = {"name": rates.get(ch_id, {}).get("name", ""),
+                                "rate": rates.get(ch_id, {}).get("rate", 0), "cells": cells}
     return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
             "channels": channels, "error": False}
 

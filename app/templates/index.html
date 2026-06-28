@@ -88,18 +88,30 @@ tr:hover{background:rgba(127,127,127,.04)}
 .ch-amount .real{font-size:18px;font-weight:700;color:var(--accent2)}
 .ch-amount .usd{font-size:12px;color:var(--text2)}
 
-/* Channel status monitor (per-minute heat strip) */
-.cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px}
-.cs-card{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:12px}
-.cs-head{display:flex;align-items:center;gap:8px;margin-bottom:10px}
-.cs-badge{width:26px;height:26px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px;min-width:26px}
-.cs-name{flex:1;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.cs-pct{font-size:12px;font-weight:600;color:var(--text2)}
-.cs-cells{display:flex;flex-wrap:wrap;gap:2px}
-.cs-cell{width:10px;height:10px;border-radius:2px;background:rgba(127,127,127,.10);cursor:default}
-.cs-cell.green{background:var(--accent2)}
-.cs-cell.yellow{background:var(--accent3)}
-.cs-cell.red{background:var(--accent4)}
+/* Channel status monitor (uptime-style cards) */
+.cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
+.cs-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
+.cs-top{display:flex;align-items:center;gap:10px}
+.cs-ic{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;flex-shrink:0}
+.cs-title{flex:1;font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cs-badge2{font-size:12px;font-weight:600;padding:3px 11px;border-radius:20px;white-space:nowrap}
+.cs-tags{display:flex;gap:6px;margin:11px 0 14px}
+.cs-tag{font-size:11px;color:var(--text2);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:2px 8px}
+.cs-metrics{display:flex;gap:20px;margin-bottom:8px}
+.cs-metric{flex:1;min-width:0}
+.cs-metric .ml{font-size:11px;color:var(--text2);display:flex;align-items:center;gap:5px}
+.cs-metric .mv{font-size:17px;font-weight:700;margin-top:4px}
+.cs-avail{display:flex;align-items:flex-end;justify-content:space-between;margin:12px 0;gap:8px}
+.cs-avail .al{font-size:11px;color:var(--text2)}
+.cs-avail .av{font-size:30px;font-weight:800;letter-spacing:-1px;line-height:1}
+.cs-avail .av small{font-size:14px;font-weight:700;margin-left:2px}
+.cs-striprow{display:flex;justify-content:space-between;font-size:10px;color:var(--text2);margin-bottom:5px}
+.cs-bars{display:flex;gap:2px;align-items:stretch;height:30px}
+.cs-bar{flex:1;min-width:2px;border-radius:1.5px;background:rgba(127,127,127,.12);cursor:default}
+.cs-bar.green{background:var(--accent2)}
+.cs-bar.yellow{background:var(--accent3)}
+.cs-bar.red{background:var(--accent4)}
+.cs-foot{display:flex;justify-content:space-between;font-size:9px;color:var(--text2);letter-spacing:1.5px;margin-top:5px}
 .cs-legend{display:flex;gap:12px;align-items:center;font-size:11px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--text2)}
 .cs-legend span{display:flex;align-items:center;gap:4px}
 .cs-legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
@@ -209,14 +221,14 @@ tr:hover{background:rgba(127,127,127,.04)}
     </div>
 
     <!-- Channel status monitor -->
-    <div class="card" style="margin-top:16px">
-      <div class="card-title">
+    <div style="margin-top:24px">
+      <div class="card-title" style="margin-bottom:14px;padding:0 2px">
         <span>渠道状态监控 (近 60 分钟 · 每格 1 分钟)</span>
         <div class="cs-legend">
           <span><i style="background:var(--accent2)"></i>≥95%</span>
           <span><i style="background:var(--accent3)"></i>90–95%</span>
           <span><i style="background:var(--accent4)"></i>&lt;90%</span>
-          <span><i style="background:rgba(127,127,127,.10)"></i>无请求</span>
+          <span><i style="background:rgba(127,127,127,.12)"></i>无请求</span>
         </div>
       </div>
       <div id="channelStatus"></div>
@@ -662,12 +674,24 @@ function renderChannelStatus(data) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">暂无渠道</div>';
     return;
   }
+  const ms = currentRefreshMs();
+  const refreshLbl = ms > 0 ? `${Math.round(ms / 1000)}S 后刷新` : '自动刷新关闭';
+  // status by window availability: green ≥95 正常 / amber ≥90 降级 / red 异常 / null 无数据
+  const STATUS = {
+    green:  { txt: '正常',  glyph: '✓', c: 'var(--accent2)', bg: 'rgba(16,185,129,.13)' },
+    yellow: { txt: '降级',  glyph: '!', c: 'var(--accent3)', bg: 'rgba(245,158,11,.15)' },
+    red:    { txt: '异常',  glyph: '✕', c: 'var(--accent4)', bg: 'rgba(239,68,68,.13)' },
+    none:   { txt: '无数据', glyph: '–', c: 'var(--text2)',  bg: 'rgba(127,127,127,.12)' },
+  };
+  const callIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>';
+  const errIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
+
   const grid = document.createElement('div');
   grid.className = 'cs-cards';
   ids.forEach((id, i) => {
     const ch = data.channels[id];
     let s = 0, t = 0;
-    const cellsHtml = ch.cells.map(c => {
+    const barsHtml = ch.cells.map(c => {
       s += c.success; t += c.total;
       let cls, tip;
       if (c.rate === null || c.total === 0) {
@@ -677,20 +701,43 @@ function renderChannelStatus(data) {
         cls = r >= 95 ? 'green' : (r >= 90 ? 'yellow' : 'red');
         tip = `${c.t}\n正确率 ${r.toFixed(1)}% (${c.success}/${c.total})`;
       }
-      return `<div class="cs-cell ${cls}" title="${tip}"></div>`;
+      return `<div class="cs-bar ${cls}" title="${tip}"></div>`;
     }).join('');
+
+    const errors = t - s;
     const pct = t > 0 ? (s / t * 100) : null;
-    const pctColor = pct === null ? 'var(--text2)' : (pct >= 95 ? 'var(--accent2)' : (pct >= 90 ? 'var(--accent3)' : 'var(--accent4)'));
-    const c = colors[i % colors.length];
+    const key = pct === null ? 'none' : (pct >= 95 ? 'green' : (pct >= 90 ? 'yellow' : 'red'));
+    const st = STATUS[key];
+    const palette = colors[i % colors.length];
     const card = document.createElement('div');
     card.className = 'cs-card';
     card.innerHTML = `
-      <div class="cs-head">
-        <span class="cs-badge" style="background:${c}20;color:${c}">${id}</span>
-        <span class="cs-name">${ch.name || '渠道 ' + id}</span>
-        <span class="cs-pct" style="color:${pctColor}">${pct === null ? '—' : pct.toFixed(1) + '%'}</span>
+      <div class="cs-top">
+        <span class="cs-ic" style="background:${st.bg};color:${st.c}">${st.glyph}</span>
+        <span class="cs-title">${ch.name || '渠道 ' + id}</span>
+        <span class="cs-badge2" style="background:${st.bg};color:${st.c}">${st.txt}</span>
       </div>
-      <div class="cs-cells">${cellsHtml}</div>`;
+      <div class="cs-tags">
+        <span class="cs-tag" style="color:${palette}">#${id}</span>
+        <span class="cs-tag">×${(ch.rate || 0)}</span>
+      </div>
+      <div class="cs-metrics">
+        <div class="cs-metric">
+          <div class="ml">${callIc} 60 分调用</div>
+          <div class="mv">${t.toLocaleString()}</div>
+        </div>
+        <div class="cs-metric">
+          <div class="ml">${errIc} 失败</div>
+          <div class="mv" style="color:${errors > 0 ? 'var(--accent4)' : 'inherit'}">${errors.toLocaleString()}</div>
+        </div>
+      </div>
+      <div class="cs-avail">
+        <span class="al">可用性 · 近 60 分</span>
+        <span class="av" style="color:${st.c}">${pct === null ? '—' : pct.toFixed(2)}<small>${pct === null ? '' : '%'}</small></span>
+      </div>
+      <div class="cs-striprow"><span>近 60 分钟</span><span>${refreshLbl}</span></div>
+      <div class="cs-bars">${barsHtml}</div>
+      <div class="cs-foot"><span>PAST</span><span>NOW</span></div>`;
     grid.appendChild(card);
   });
   wrap.innerHTML = '';
