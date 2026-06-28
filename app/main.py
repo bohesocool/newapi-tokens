@@ -355,6 +355,12 @@ def get_rates_at(target_dt):
         rows = conn.execute("SELECT id, name, rate FROM channels").fetchall()
     return {r["id"]: {"name": r["name"], "rate": get_rate_at(r["id"], target_dt)} for r in rows}
 
+def get_rates():
+    """Get channel rates from DB."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, name, rate FROM channels ORDER BY id").fetchall()
+        return {r["id"]: {"name": r["name"], "rate": r["rate"]} for r in rows}
+
 # ── Snapshot helpers ──
 def save_hourly_snapshot(start_dt, channels_data, total_real, total_usd, total_calls):
     snap = {
