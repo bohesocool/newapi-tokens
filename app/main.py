@@ -352,6 +352,22 @@ ORDER BY channel_id, m"""
         }
     return out
 
+def query_pg_rpm(start_ts, end_ts):
+    """Per-channel request count (success type=2 + error type=5) for the token in
+    [start, end). Used for a trailing-60s RPM gauge. Returns {channel_id: count} or None."""
+    sql = """
+SELECT channel_id, count(*)
+FROM logs
+WHERE type IN (2, 5)
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s
+GROUP BY channel_id"""
+    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    if rows is None:
+        return None
+    return {int(r[0]): int(r[1]) for r in rows}
+
 def now_shanghai():
     return datetime.now(SHANGHAI)
 
@@ -659,6 +675,10 @@ def _compute_channel_status(minutes):
     if data is None:
         return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
                 "channels": {}, "error": True}
+    # Trailing-60s request count per channel = current RPM (independent of the minute buckets).
+    rpm_end = int(now.timestamp())
+    rpm_map = query_pg_rpm(rpm_end - 60, rpm_end) or {}
+    total_rpm = sum(rpm_map.values())
     bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
     bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
     bucket_lbl = [b.strftime("%m-%d %H:%M") for b in bucket_dts]
@@ -676,9 +696,10 @@ def _compute_channel_status(minutes):
             else:
                 cells.append({"t": lbl, "success": 0, "errors": 0, "total": 0, "rate": None})
         channels[str(ch_id)] = {"name": rates.get(ch_id, {}).get("name", ""),
-                                "rate": rates.get(ch_id, {}).get("rate", 0), "cells": cells}
+                                "rate": rates.get(ch_id, {}).get("rate", 0),
+                                "rpm": rpm_map.get(ch_id, 0), "cells": cells}
     return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
-            "channels": channels, "error": False}
+            "channels": channels, "total_rpm": total_rpm, "error": False}
 
 @app.post("/api/snapshot/hourly", dependencies=[Depends(require_auth)])
 def api_snapshot_hourly():

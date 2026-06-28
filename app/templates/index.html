@@ -202,6 +202,11 @@ tr:hover{background:rgba(127,127,127,.04)}
         <div class="stat-value" id="perMin">$0.00</div>
         <div class="stat-label">/min</div>
       </div>
+      <div class="card stat-card blue">
+        <div class="stat-label">当前 RPM</div>
+        <div class="stat-value" id="curRpm">--</div>
+        <div class="stat-label">近 60 秒请求数 · 全渠道</div>
+      </div>
     </div>
 
     <!-- Server Load -->
@@ -716,6 +721,8 @@ async function loadChannelStatus() {
 function renderChannelStatus(data) {
   const wrap = document.getElementById('channelStatus');
   if (!wrap) return;
+  const rpmEl = document.getElementById('curRpm');
+  if (rpmEl) rpmEl.textContent = data.error ? '—' : (data.total_rpm || 0).toLocaleString();
   const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
   if (data.error) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">数据库查询失败，暂无渠道状态</div>';
@@ -736,6 +743,7 @@ function renderChannelStatus(data) {
     none:   { txt: '无数据', glyph: '–', c: 'var(--text2)',  bg: 'rgba(127,127,127,.12)' },
   };
   const callIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>';
+  const rpmIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
   const errIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
 
   const grid = document.createElement('div');
@@ -776,6 +784,10 @@ function renderChannelStatus(data) {
         <span class="cs-tag">×${(ch.rate || 0)}</span>
       </div>
       <div class="cs-metrics">
+        <div class="cs-metric">
+          <div class="ml">${rpmIc} 当前 RPM</div>
+          <div class="mv" style="color:${(ch.rpm||0) > 0 ? 'var(--accent)' : 'inherit'}">${(ch.rpm||0).toLocaleString()}</div>
+        </div>
         <div class="cs-metric">
           <div class="ml">${callIc} 60 分调用</div>
           <div class="mv">${t.toLocaleString()}</div>
