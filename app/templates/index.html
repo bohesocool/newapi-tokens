@@ -297,8 +297,10 @@ tr:hover{background:rgba(127,127,127,.04)}
         <div class="set-row" style="margin-top:10px">
           <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="pushHourly" onchange="saveWebhook()"> 推送小时报</label>
           <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="pushDaily" onchange="saveWebhook()"> 推送日报</label>
+          <label style="display:flex;gap:6px;align-items:center;cursor:pointer"><input type="checkbox" id="pushError" onchange="saveWebhook()"> 推送渠道错误率告警</label>
         </div>
         <div class="set-hint">触发时机：每个整点存完快照后推送上一小时的小时报；每日 0 点归档后推送前一日日报。</div>
+        <div class="set-hint">错误率告警：每分钟统计各渠道 失败/(成功+失败)，该分钟总调用 ≥20 且错误率 ≥10% 即推送；恢复正常补发一条「已恢复」。</div>
       </div>
     </div>
   </div>
@@ -460,11 +462,15 @@ async function loadDashboard() {
     sortedChannels.forEach((ch, i) => {
       const row = document.createElement('div');
       row.className = 'ch-row';
+      const errTotal = (ch.calls||0) + (ch.errors||0);
+      const errRate = errTotal > 0 ? (ch.errors||0) / errTotal : 0;
+      const errColor = errRate >= 0.10 ? '#ef4444' : 'var(--muted)';
+      const errHtml = `<span style="color:${errColor}"> · 错误率 ${(errRate*100).toFixed(1)}% (${(ch.errors||0).toLocaleString()}失败)</span>`;
       row.innerHTML = `
         <div class="ch-badge" style="background:${colors[i % colors.length]}20;color:${colors[i % colors.length]}">${ch.id}</div>
         <div class="ch-info">
           <div class="ch-name">${ch.name || '渠道 ' + ch.id}</div>
-          <div class="ch-stats">${(ch.calls||0).toLocaleString()} 次 · ${fmtNum(ch.prompt_tokens||0)}+${fmtNum(ch.completion_tokens||0)} tok</div>
+          <div class="ch-stats">${(ch.calls||0).toLocaleString()} 次 · ${fmtNum(ch.prompt_tokens||0)}+${fmtNum(ch.completion_tokens||0)} tok${errHtml}</div>
         </div>
         <div class="ch-amount">
           <div class="real">${fmtMoney(ch.real_cost||0)}</div>
@@ -776,6 +782,7 @@ async function loadWebhook() {
     document.getElementById('webhookUrl').value = d.url || '';
     document.getElementById('pushHourly').checked = !!d.push_hourly;
     document.getElementById('pushDaily').checked = !!d.push_daily;
+    document.getElementById('pushError').checked = !!d.push_error;
   } catch(e) { console.error('Webhook load error:', e); }
 }
 async function saveWebhook() {
@@ -783,6 +790,7 @@ async function saveWebhook() {
     url: document.getElementById('webhookUrl').value,
     push_hourly: document.getElementById('pushHourly').checked,
     push_daily: document.getElementById('pushDaily').checked,
+    push_error: document.getElementById('pushError').checked,
   };
   try {
     await apiFetch('/api/settings/webhook', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});

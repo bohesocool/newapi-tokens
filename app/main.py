@@ -28,6 +28,10 @@ PG_DB = os.environ.get("PG_DB", "new-api")
 TOKEN_NAME = os.environ.get("TOKEN_NAME", "ducker")
 QUOTA_PER_USD = 500000
 
+# 渠道错误率监控（可按需调整）
+ERROR_RATE_THRESHOLD = 0.10   # 错误率 ≥ 10% 触发告警
+ERROR_MIN_SAMPLE = 20         # 该分钟总调用 < 20 不参与判定，避免低流量误报
+
 app = FastAPI(title="NewAPI Monitor")
 app.add_middleware(
     CORSMiddleware,
@@ -221,19 +225,21 @@ def fmt_num(n):
     return str(n)
 
 def query_pg(start_ts, end_ts):
-    """Query NewAPI PostgreSQL for ducker token usage."""
+    """Query NewAPI PostgreSQL for token usage. Single query returns per-channel
+    success(type=2) aggregates plus error(type=5) count via FILTER — uses idx_created_at_type."""
     # token_name passed as a psql variable (:'tok') so it is safely quoted;
     # start/end are coerced to int, QUOTA_PER_USD is an internal constant.
     sql = """BEGIN READ ONLY;
 SELECT
   channel_id,
-  count(*),
-  COALESCE(sum(quota), 0),
-  round(COALESCE(sum(quota), 0)::numeric / {qpu}, 4),
-  COALESCE(sum(prompt_tokens), 0),
-  COALESCE(sum(completion_tokens), 0)
+  count(*) FILTER (WHERE type = 2),
+  COALESCE(sum(quota) FILTER (WHERE type = 2), 0),
+  round(COALESCE(sum(quota) FILTER (WHERE type = 2), 0)::numeric / {qpu}, 4),
+  COALESCE(sum(prompt_tokens) FILTER (WHERE type = 2), 0),
+  COALESCE(sum(completion_tokens) FILTER (WHERE type = 2), 0),
+  count(*) FILTER (WHERE type = 5)
 FROM logs
-WHERE type = 2
+WHERE type IN (2, 5)
   AND token_name = :'tok'
   AND created_at >= {start}
   AND created_at < {end}
@@ -265,7 +271,7 @@ def parse_pg_rows(raw):
         if not line:
             continue
         parts = line.split("|")
-        if len(parts) < 6:
+        if len(parts) < 7:
             continue
         ch_id = int(parts[0])
         channels[ch_id] = {
@@ -274,10 +280,49 @@ def parse_pg_rows(raw):
             "usd": float(parts[3]),
             "prompt_tokens": int(parts[4]),
             "completion_tokens": int(parts[5]),
+            "errors": int(parts[6]),
         }
     return channels
 
-def get_rates():
+def query_pg_error_rates(start_ts, end_ts):
+    """Per-channel success(type=2)/error(type=5) counts for the token in [start, end).
+    Single aggregated query — uses the idx_created_at_type index, scans only ~1 min of rows."""
+    sql = """BEGIN READ ONLY;
+SELECT
+  channel_id,
+  count(*) FILTER (WHERE type = 2),
+  count(*) FILTER (WHERE type = 5)
+FROM logs
+WHERE type IN (2, 5)
+  AND token_name = :'tok'
+  AND created_at >= {start}
+  AND created_at < {end}
+GROUP BY channel_id
+ORDER BY channel_id;
+COMMIT;""".format(start=int(start_ts), end=int(end_ts))
+    try:
+        result = subprocess.run(
+            ["/usr/bin/docker", "exec", PG_CONTAINER, "psql",
+             "-U", PG_USER, "-d", PG_DB,
+             "-t", "-A", "-F", "|", "-v", f"tok={TOKEN_NAME}", "-c", sql],
+            capture_output=True, text=True, timeout=30
+        )
+    except Exception as e:
+        print(f"[query_pg_error_rates] subprocess error: {e}", flush=True)
+        return None
+    if result.returncode != 0:
+        print(f"[query_pg_error_rates] psql failed rc={result.returncode}: {result.stderr.strip()}", flush=True)
+        return None
+    rows = {}
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("|")
+        if len(parts) < 3:
+            continue
+        rows[int(parts[0])] = {"success": int(parts[1]), "errors": int(parts[2])}
+    return rows
     """Get channel rates from DB."""
     with get_db() as conn:
         rows = conn.execute("SELECT id, name, rate FROM channels ORDER BY id").fetchall()
@@ -317,6 +362,7 @@ def save_hourly_snapshot(start_dt, channels_data, total_real, total_usd, total_c
         "total_real": total_real,
         "total_usd": total_usd,
         "total_calls": total_calls,
+        "total_errors": sum(d.get("errors", 0) for d in channels_data.values()),
     }
     for ch_id, d in channels_data.items():
         snap["channels"][str(ch_id)] = {
@@ -325,6 +371,7 @@ def save_hourly_snapshot(start_dt, channels_data, total_real, total_usd, total_c
             "real_cost": d["real_cost"],
             "prompt_tokens": d["prompt_tokens"],
             "completion_tokens": d["completion_tokens"],
+            "errors": d.get("errors", 0),
         }
     f = SNAPSHOT_DIR / f"{start_dt.strftime('%Y-%m-%d')}_{start_dt.hour:02d}.json"
     f.write_text(json.dumps(snap, ensure_ascii=False, indent=2))
@@ -346,12 +393,13 @@ def load_snapshots(start_dt, end_dt):
                 ch_id = int(ch_id_str)
                 if ch_id not in channels:
                     channels[ch_id] = {"calls": 0, "usd": 0.0, "real_cost": 0.0,
-                                      "prompt_tokens": 0, "completion_tokens": 0}
+                                      "prompt_tokens": 0, "completion_tokens": 0, "errors": 0}
                 channels[ch_id]["calls"] += ch_data["calls"]
                 channels[ch_id]["usd"] += ch_data["usd"]
                 channels[ch_id]["real_cost"] += ch_data["real_cost"]
                 channels[ch_id]["prompt_tokens"] += ch_data["prompt_tokens"]
                 channels[ch_id]["completion_tokens"] += ch_data["completion_tokens"]
+                channels[ch_id]["errors"] += ch_data.get("errors", 0)
             total_real += snap.get("total_real", 0)
             total_usd += snap.get("total_usd", 0)
             total_calls += snap.get("total_calls", 0)
@@ -496,13 +544,14 @@ def api_hourly():
     for ch_id, d in cur_data.items():
         if ch_id not in all_channels:
             all_channels[ch_id] = {"calls": 0, "usd": 0, "real_cost": 0,
-                                   "prompt_tokens": 0, "completion_tokens": 0,
+                                   "prompt_tokens": 0, "completion_tokens": 0, "errors": 0,
                                    "name": d.get("name", "")}
         all_channels[ch_id]["calls"] += d["calls"]
         all_channels[ch_id]["usd"] += d["usd"]
         all_channels[ch_id]["real_cost"] += d["real_cost"]
         all_channels[ch_id]["prompt_tokens"] += d["prompt_tokens"]
         all_channels[ch_id]["completion_tokens"] += d["completion_tokens"]
+        all_channels[ch_id]["errors"] = all_channels[ch_id].get("errors", 0) + d.get("errors", 0)
     
     today_total_real = snap_real + cur_total_real
     today_total_usd = snap_usd + cur_total_usd
@@ -666,6 +715,7 @@ class WebhookBody(BaseModel):
     url: Optional[str] = None
     push_hourly: Optional[bool] = None
     push_daily: Optional[bool] = None
+    push_error: Optional[bool] = None
 
 @app.post("/api/login")
 def api_login(body: LoginBody, request: Request):
@@ -723,6 +773,7 @@ def api_get_webhook():
         "url": get_setting("webhook_url") or "",
         "push_hourly": (get_setting("webhook_push_hourly") or "0") == "1",
         "push_daily": (get_setting("webhook_push_daily") or "0") == "1",
+        "push_error": (get_setting("webhook_push_error") or "0") == "1",
     }
 
 @app.post("/api/settings/webhook", dependencies=[Depends(require_session)])
@@ -733,6 +784,8 @@ def api_set_webhook(body: WebhookBody):
         set_setting("webhook_push_hourly", "1" if body.push_hourly else "0")
     if body.push_daily is not None:
         set_setting("webhook_push_daily", "1" if body.push_daily else "0")
+    if body.push_error is not None:
+        set_setting("webhook_push_error", "1" if body.push_error else "0")
     return {"ok": True}
 
 @app.post("/api/settings/webhook/test", dependencies=[Depends(require_session)])
@@ -886,7 +939,60 @@ def push_webhook(report_type, text, data):
         print(f"[webhook] push failed: {e}", flush=True)
         return False
 
-# ── Scheduler / startup ──
+# ── 渠道错误率监控 ──
+_error_alerting = {}  # channel_id -> True，当前处于告警态（用于判断「恢复」）；进程重启即清空
+
+def _build_error_alert(ch_id, name, success, errors, rate, minute_label, recovered=False):
+    head = f"渠道 {ch_id}" + (f" ({name})" if name else "")
+    pct = f"{rate * 100:.1f}%"
+    thr = f"{int(ERROR_RATE_THRESHOLD * 100)}%"
+    if recovered:
+        return (f"✅ NewAPI 渠道恢复\n━━━━━━━━━━━━━━━━━\n"
+                f"📌 {head}\n⏰ 时段: {minute_label}\n"
+                f"📉 错误率回落 {pct}（< {thr}）\n"
+                f"  成功 {success:,} / 失败 {errors:,}\n"
+                f"━━━━━━━━━━━━━━━━━")
+    return (f"🚨 NewAPI 渠道错误率告警\n━━━━━━━━━━━━━━━━━\n"
+            f"📌 {head}\n⏰ 时段: {minute_label}\n"
+            f"⚠️ 错误率 {pct} ≥ {thr}\n"
+            f"  失败 {errors:,} / 总计 {success + errors:,}\n"
+            f"  成功 {success:,}\n"
+            f"━━━━━━━━━━━━━━━━━")
+
+def check_error_rates():
+    """检查刚结束的一整分钟：每渠道错误率 ≥ 阈值则推送，回落到正常补发恢复通知。"""
+    if (get_setting("webhook_push_error") or "0") != "1":
+        return
+    if not (get_setting("webhook_url") or "").strip():
+        return
+    now = now_shanghai()
+    minute_start = now.replace(second=0, microsecond=0)
+    window_start = minute_start - timedelta(minutes=1)
+    rows = query_pg_error_rates(int(window_start.timestamp()), int(minute_start.timestamp()))
+    if rows is None:
+        return  # 查询失败，静默跳过本分钟（不把监控自身故障当成渠道故障）
+    rates = get_rates()
+    minute_label = f"{window_start.strftime('%m-%d %H:%M')} → {minute_start.strftime('%H:%M')}"
+    for ch_id, d in rows.items():
+        total = d["success"] + d["errors"]
+        if total < ERROR_MIN_SAMPLE:
+            continue  # 样本不足，不判定（告警态保持不变，等有足够样本的分钟再决定）
+        rate = d["errors"] / total
+        name = rates.get(ch_id, {}).get("name", "")
+        payload = {"channel_id": ch_id, "name": name, "success": d["success"],
+                   "errors": d["errors"], "total": total, "rate": rate}
+        if rate >= ERROR_RATE_THRESHOLD:
+            _error_alerting[ch_id] = True
+            push_webhook("error_alert",
+                         _build_error_alert(ch_id, name, d["success"], d["errors"], rate, minute_label),
+                         payload)
+        elif _error_alerting.pop(ch_id, None):
+            # 之前在告警态，本分钟样本足够且已恢复正常 → 发恢复通知
+            push_webhook("error_recovered",
+                         _build_error_alert(ch_id, name, d["success"], d["errors"], rate, minute_label, recovered=True),
+                         payload)
+
+
 def _run_scheduler():
     """Every full hour: save the completed hour's snapshot, push hourly report,
     and at midnight finalize the previous day + push the daily report."""
@@ -926,6 +1032,17 @@ def _run_scheduler():
             except Exception as e:
                 print(f"[Scheduler] daily error: {e}", flush=True)
 
+def _run_error_monitor():
+    """每分钟检查一次上一整分钟的渠道错误率。对齐分钟边界 +5s，给尾部日志写入留出落库时间。"""
+    while True:
+        now = now_shanghai()
+        next_min = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        time.sleep(max(1, (next_min - now).total_seconds() + 5))
+        try:
+            check_error_rates()
+        except Exception as e:
+            print(f"[ErrorMonitor] error: {e}", flush=True)
+
 @app.on_event("startup")
 def _on_startup():
     try:
@@ -938,6 +1055,7 @@ def _on_startup():
         print(f"[Startup] cleanup error: {e}", flush=True)
     import threading
     threading.Thread(target=_run_scheduler, daemon=True).start()
+    threading.Thread(target=_run_error_monitor, daemon=True).start()
     print("[Startup] scheduler started", flush=True)
 
 # ── Static files & main page ──
