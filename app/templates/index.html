@@ -1126,6 +1126,7 @@ function escapeHtml(s) {
 }
 
 // ── Settings ──
+async function loadSettings() {
   try {
     const resp = await apiFetch('/api/settings');
     const d = await resp.json();
