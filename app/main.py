@@ -122,6 +122,14 @@ def init_db():
             key TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS cost_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type TEXT NOT NULL,          -- 'income' or 'expense'
+            amount REAL NOT NULL,
+            date TEXT NOT NULL,          -- 'YYYY-MM-DD'
+            note TEXT DEFAULT '',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
         """)
         # Seed default channels if empty
         row = conn.execute("SELECT count(*) FROM channels").fetchone()
@@ -495,6 +503,12 @@ class ChannelCreate(BaseModel):
     id: int
     name: str = ""
     rate: float = 0.0
+
+class CostRecordBody(BaseModel):
+    type: str           # 'income' or 'expense'
+    amount: float
+    date: str           # 'YYYY-MM-DD'
+    note: str = ""
 
 # ── API Routes ──
 
@@ -955,6 +969,91 @@ def api_rate_history(limit: int = 200):
             "ORDER BY rh.changed_at DESC, rh.id DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+# ── 成本记录 (收入/支出，手动记账，独立页面，不与监控联动) ──
+def _week_start_shanghai(date_str):
+    """Return the Monday (Shanghai tz) for the given 'YYYY-MM-DD' string."""
+    dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=SHANGHAI)
+    monday = dt - timedelta(days=dt.weekday())  # weekday(): Mon=0..Sun=6
+    return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+@app.get("/api/cost/records", dependencies=[Depends(require_auth)])
+def api_cost_records():
+    """All cost records (income/expense), newest first."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, type, amount, date, note, created_at FROM cost_records "
+            "ORDER BY date DESC, id DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+@app.post("/api/cost/records", dependencies=[Depends(require_session)])
+def api_cost_add(body: CostRecordBody):
+    if body.type not in ("income", "expense"):
+        raise HTTPException(400, "类型必须是 income 或 expense")
+    if body.amount <= 0:
+        raise HTTPException(400, "金额必须大于 0")
+    try:
+        datetime.strptime(body.date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO cost_records (type, amount, date, note) VALUES (?, ?, ?, ?)",
+            (body.type, body.amount, body.date, body.note.strip()),
+        )
+        conn.commit()
+    return {"ok": True}
+
+@app.delete("/api/cost/records/{rid}", dependencies=[Depends(require_session)])
+def api_cost_delete(rid: int):
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM cost_records WHERE id = ?", (rid,))
+        conn.commit()
+        if cur.rowcount == 0:
+            raise HTTPException(404, "记录不存在")
+    return {"ok": True}
+
+@app.get("/api/cost/weekly", dependencies=[Depends(require_auth)])
+def api_cost_weekly(weeks: int = 8):
+    """Per-week aggregates. Each bucket covers Mon→Sun (Shanghai).
+    Returns the last `weeks` weeks up to the current week, oldest first."""
+    weeks = max(1, min(weeks, 52))
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT type, amount, date FROM cost_records"
+        ).fetchall()
+    today_monday = _week_start_shanghai(now_shanghai().strftime("%Y-%m-%d"))
+    buckets = []
+    for i in range(weeks - 1, -1, -1):
+        ws = today_monday - timedelta(weeks=i)
+        we = ws + timedelta(days=7)
+        buckets.append({
+            "week_start": ws.strftime("%Y-%m-%d"),
+            "week_end": (we - timedelta(days=1)).strftime("%Y-%m-%d"),
+            "income": 0.0,
+            "expense": 0.0,
+        })
+    for r in rows:
+        try:
+            ws = _week_start_shanghai(r["date"])
+        except (ValueError, TypeError):
+            continue
+        delta_weeks = (today_monday - ws).days // 7
+        if 0 <= delta_weeks < weeks:
+            b = buckets[weeks - 1 - delta_weeks]
+            if r["type"] == "income":
+                b["income"] += r["amount"]
+            elif r["type"] == "expense":
+                b["expense"] += r["amount"]
+    total_income = sum(b["income"] for b in buckets)
+    total_expense = sum(b["expense"] for b in buckets)
+    return {
+        "weeks": buckets,
+        "total_income": total_income,
+        "total_expense": total_expense,
+        "net": total_income - total_expense,
+    }
 
 # ── Report text builders & webhook push ──
 def _channel_report_lines(channels):

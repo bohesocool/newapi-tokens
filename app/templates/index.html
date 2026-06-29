@@ -174,6 +174,7 @@ tr:hover{background:rgba(127,127,127,.04)}
     <div class="tab active" onclick="switchTab('dashboard')">仪表盘</div>
     <div class="tab" onclick="switchTab('channels')">渠道管理</div>
     <div class="tab" onclick="switchTab('history')">历史日报</div>
+    <div class="tab" onclick="switchTab('cost')">成本</div>
     <div class="tab" onclick="switchTab('settings')">设置</div>
   </div>
 
@@ -318,6 +319,68 @@ tr:hover{background:rgba(127,127,127,.04)}
     </div>
   </div>
 
+  <!-- Cost Tab -->
+  <div id="tab-cost" style="display:none">
+    <!-- Summary Cards -->
+    <div class="grid grid-cards" style="margin-bottom:16px">
+      <div class="card stat-card green">
+        <div class="stat-label">累计收入</div>
+        <div class="stat-value" id="costTotalIncome">$0.00</div>
+        <div class="stat-label">共 <span id="costIncomeCount">0</span> 笔</div>
+      </div>
+      <div class="card stat-card red">
+        <div class="stat-label">累计支出</div>
+        <div class="stat-value" id="costTotalExpense">$0.00</div>
+        <div class="stat-label">共 <span id="costExpenseCount">0</span> 笔</div>
+      </div>
+      <div class="card stat-card blue">
+        <div class="stat-label">累计结余</div>
+        <div class="stat-value" id="costNet">$0.00</div>
+        <div class="stat-label">收入 − 支出</div>
+      </div>
+    </div>
+
+    <!-- Weekly chart -->
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-title">
+        <span>每周收支 (周一 → 周日)</span>
+        <select class="select" id="costWeeks" onchange="loadCostWeekly()">
+          <option value="4">近 4 周</option>
+          <option value="8" selected>近 8 周</option>
+          <option value="12">近 12 周</option>
+        </select>
+      </div>
+      <canvas id="costChart"></canvas>
+    </div>
+
+    <!-- Add record -->
+    <div class="card" style="margin-bottom:16px;max-width:760px">
+      <div class="card-title">添加记录</div>
+      <form class="set-row" onsubmit="return addCostRecord(event)">
+        <select class="select" id="costType" style="width:90px">
+          <option value="expense">支出</option>
+          <option value="income">收入</option>
+        </select>
+        <input class="pw-input" id="costAmount" type="number" step="0.01" min="0" placeholder="金额" style="width:120px">
+        <input class="pw-input" id="costDate" type="date" style="width:150px">
+        <input class="pw-input" id="costNote" type="text" placeholder="备注 (可选)" style="flex:1;min-width:160px">
+        <button class="btn" type="submit">添加</button>
+      </form>
+      <div class="set-hint">每笔记录含金额、日期、备注。统计以周一为一周起点。</div>
+    </div>
+
+    <!-- Records list -->
+    <div class="card">
+      <div class="card-title">收支记录</div>
+      <table>
+        <thead>
+          <tr><th>日期</th><th>类型</th><th>金额</th><th>备注</th><th>操作</th></tr>
+        </thead>
+        <tbody id="costBody"></tbody>
+      </table>
+    </div>
+  </div>
+
   <!-- Settings Tab -->
   <div id="tab-settings" style="display:none">
     <div class="card" style="max-width:760px">
@@ -448,6 +511,7 @@ function switchTab(tab) {
   document.getElementById('tab-' + tab).style.display = '';
   if (tab === 'channels') loadChannels();
   if (tab === 'history') loadHistory();
+  if (tab === 'cost') loadCost();
   if (tab === 'settings') loadSettings();
 }
 
@@ -947,8 +1011,121 @@ async function showHistoryDetail(date) {
   alert(msg);
 }
 
+// ── Cost (收入/支出记账) ──
+let costChart = null;
+function loadCost() {
+  // Default the date field to today.
+  const d = document.getElementById('costDate');
+  if (!d.value) {
+    const t = new Date();
+    d.value = `${t.getFullYear()}-${String(t.getMonth()+1).padStart(2,'0')}-${String(t.getDate()).padStart(2,'0')}`;
+  }
+  loadCostRecords();
+  loadCostWeekly();
+}
+async function loadCostRecords() {
+  try {
+    const resp = await apiFetch('/api/cost/records');
+    const items = await resp.json();
+    const tb = document.getElementById('costBody');
+    let inc = 0, exp = 0, incN = 0, expN = 0;
+    tb.innerHTML = '';
+    if (!items.length) {
+      tb.innerHTML = '<tr><td colspan="5" style="color:var(--text2)">暂无记录</td></tr>';
+    }
+    items.forEach(it => {
+      if (it.type === 'income') { inc += it.amount; incN++; }
+      else { exp += it.amount; expN++; }
+      const tr = document.createElement('tr');
+      const typeTxt = it.type === 'income'
+        ? '<span style="color:var(--accent2)">收入</span>'
+        : '<span style="color:var(--accent4)">支出</span>';
+      tr.innerHTML = `
+        <td style="white-space:nowrap">${it.date}</td>
+        <td>${typeTxt}</td>
+        <td style="font-weight:600">${fmtMoney(it.amount)}</td>
+        <td style="color:var(--text2)">${escapeHtml(it.note || '')}</td>
+        <td><button class="btn btn-danger btn-sm" onclick="deleteCostRecord(${it.id})">删除</button></td>
+      `;
+      tb.appendChild(tr);
+    });
+    document.getElementById('costTotalIncome').textContent = fmtMoney(inc);
+    document.getElementById('costTotalExpense').textContent = fmtMoney(exp);
+    document.getElementById('costNet').textContent = fmtMoney(inc - exp);
+    document.getElementById('costIncomeCount').textContent = incN;
+    document.getElementById('costExpenseCount').textContent = expN;
+  } catch(e) { console.error('Cost records error:', e); }
+}
+async function addCostRecord(e) {
+  e.preventDefault();
+  const type = document.getElementById('costType').value;
+  const amount = parseFloat(document.getElementById('costAmount').value);
+  const date = document.getElementById('costDate').value;
+  const note = document.getElementById('costNote').value;
+  if (!amount || amount <= 0) { toast('请输入有效金额'); return false; }
+  if (!date) { toast('请选择日期'); return false; }
+  try {
+    await apiFetch('/api/cost/records', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({type, amount, date, note})});
+    toast('已添加');
+    document.getElementById('costAmount').value = '';
+    document.getElementById('costNote').value = '';
+    loadCostRecords();
+    loadCostWeekly();
+  } catch(e) { toast('添加失败'); }
+  return false;
+}
+async function deleteCostRecord(id) {
+  if (!confirm('确认删除这条记录？')) return;
+  try {
+    await apiFetch('/api/cost/records/' + id, {method:'DELETE'});
+    toast('已删除');
+    loadCostRecords();
+    loadCostWeekly();
+  } catch(e) { toast('删除失败'); }
+}
+async function loadCostWeekly() {
+  try {
+    const weeks = document.getElementById('costWeeks').value;
+    const resp = await apiFetch('/api/cost/weekly?weeks=' + weeks);
+    const d = await resp.json();
+    renderCostChart(d);
+  } catch(e) { console.error('Cost weekly error:', e); }
+}
+function renderCostChart(d) {
+  const ctx = document.getElementById('costChart');
+  if (!ctx) return;
+  const labels = d.weeks.map(w => w.week_start.slice(5));
+  const income = d.weeks.map(w => w.income || 0);
+  const expense = d.weeks.map(w => w.expense || 0);
+  if (costChart) costChart.destroy();
+  const axisColor = cssVar('--text2') || '#6b7a99';
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  const gridColor = isLight ? 'rgba(15,23,42,0.06)' : 'rgba(255,255,255,0.05)';
+  costChart = new Chart(ctx, {
+    type: 'bar',
+    data: { labels, datasets: [
+      { label: '收入', data: income, backgroundColor: 'rgba(16,185,129,0.6)', borderRadius: 4, borderWidth: 0 },
+      { label: '支出', data: expense, backgroundColor: 'rgba(239,68,68,0.6)', borderRadius: 4, borderWidth: 0 },
+    ]},
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: axisColor, font: { size: 11 } } },
+        tooltip: { callbacks: { label: c => c.dataset.label + ': ' + fmtMoney(c.parsed.y) } }
+      },
+      scales: {
+        x: { grid: { color: gridColor }, ticks: { color: axisColor, font: { size: 10 } } },
+        y: { grid: { color: gridColor }, ticks: { color: axisColor, callback: v => '$' + v } }
+      }
+    }
+  });
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 // ── Settings ──
-async function loadSettings() {
   try {
     const resp = await apiFetch('/api/settings');
     const d = await resp.json();
