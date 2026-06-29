@@ -456,36 +456,46 @@ def _http_request(method, url, headers=None, body=None, opener=None):
         parsed = raw
     return status, parsed
 
+def _sub2api_login(api, account, password, rt):
+    """Email+password login. Returns (balance_or_None, access_token_or_None, new_rt).
+    Login already returns balance directly in most cases."""
+    st, body = _http_request("POST", api + "/auth/login",
+                             body={"email": account, "password": password, "turnstile_token": ""})
+    if not (st == 200 and isinstance(body, dict) and body.get("code") == 0):
+        raise RuntimeError(_api_err(body, st, "登录失败"))
+    d = body.get("data") or {}
+    if d.get("requires_2fa"):
+        raise RuntimeError("账号开启了 2FA，无法用账号密码自动查询")
+    new_rt = d.get("refresh_token") or rt
+    user = d.get("user") or {}
+    if user.get("balance") is not None:  # login already returns balance
+        return float(user["balance"]), None, new_rt
+    return None, d.get("access_token"), new_rt
+
 def _fetch_sub2api(base, account, password, rt):
-    """Return (balance_usd, new_rt). Prefers RT (refresh -> AT -> /auth/me);
-    falls back to email+password login (which already returns balance)."""
+    """Return (balance_usd, new_rt). Prefers RT (refresh -> AT -> /auth/me); the rotated
+    RT is returned to be persisted. sub2api RTs are single-use (each refresh invalidates the
+    old one), so a chain shared with another client breaks — when account+password are also
+    set we fall back to a fresh login, which returns balance and a new RT to resume the chain."""
     base = base.rstrip("/")
     api = base if base.endswith("/api/v1") else base + "/api/v1"
-    new_rt, access = rt, None
+    new_rt, access, balance = rt, None, None
     if rt:
         st, body = _http_request("POST", api + "/auth/refresh", body={"refresh_token": rt})
         if st == 200 and isinstance(body, dict) and body.get("code") == 0:
             d = body.get("data") or {}
             access = d.get("access_token")
             new_rt = d.get("refresh_token") or rt
+        elif account and password:
+            balance, access, new_rt = _sub2api_login(api, account, password, rt)  # 自愈回退
         else:
             raise RuntimeError(_api_err(body, st, "RT 刷新失败"))
     elif account and password:
-        st, body = _http_request("POST", api + "/auth/login",
-                                 body={"email": account, "password": password, "turnstile_token": ""})
-        if st == 200 and isinstance(body, dict) and body.get("code") == 0:
-            d = body.get("data") or {}
-            if d.get("requires_2fa"):
-                raise RuntimeError("账号开启了 2FA，请改用 RT 方式")
-            new_rt = d.get("refresh_token") or rt
-            user = d.get("user") or {}
-            if user.get("balance") is not None:  # login already returns balance
-                return float(user["balance"]), new_rt
-            access = d.get("access_token")
-        else:
-            raise RuntimeError(_api_err(body, st, "登录失败"))
+        balance, access, new_rt = _sub2api_login(api, account, password, rt)
     else:
         raise RuntimeError("未配置 RT 或账号密码")
+    if balance is not None:
+        return balance, new_rt
     if not access:
         raise RuntimeError("未获取到 access_token")
     st, body = _http_request("GET", api + "/auth/me", headers={"Authorization": "Bearer " + access})
