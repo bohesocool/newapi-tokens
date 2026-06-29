@@ -78,6 +78,20 @@ tr:hover{background:rgba(127,127,127,.04)}
 .btn-danger{background:var(--accent4)}
 .btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text2)}
 .btn-ghost:hover{color:var(--text);border-color:var(--accent);opacity:1}
+/* Balance config modal */
+.bal-overlay{display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,.5);align-items:flex-start;justify-content:center;padding:60px 16px;overflow:auto}
+.bal-overlay.show{display:flex}
+.bal-dialog{background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);width:100%;max-width:440px}
+.bal-head{display:flex;justify-content:space-between;align-items:center;padding:16px 18px;border-bottom:1px solid var(--border);font-weight:600;font-size:15px}
+.bal-body{padding:16px 18px}
+.bal-label{display:block;font-size:12px;color:var(--text2);margin:12px 0 5px;font-weight:500}
+.bal-hint{color:var(--accent);margin-left:8px;font-weight:400}
+.bal-input{width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:8px;padding:8px 11px;font-size:13px;box-sizing:border-box}
+.bal-or{font-size:11px;color:var(--text2);text-align:center;margin:14px 0 4px;position:relative}
+.bal-grp{display:none}
+.bal-grp.show{display:block}
+.bal-result{margin-top:14px;font-size:13px;min-height:18px}
+.bal-foot{display:flex;justify-content:flex-end;gap:8px;padding:14px 18px;border-top:1px solid var(--border)}
 
 /* Channel breakdown */
 .ch-row{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid var(--border)}
@@ -286,7 +300,7 @@ tr:hover{background:rgba(127,127,127,.04)}
       <div class="card-title">渠道系数管理</div>
       <table id="channelsTable">
         <thead>
-          <tr><th>ID</th><th>名称</th><th>系数</th><th>更新时间</th><th>操作</th></tr>
+          <tr><th>ID</th><th>名称</th><th>系数</th><th>余额查询</th><th>更新时间</th><th>操作</th></tr>
         </thead>
         <tbody id="channelsBody"></tbody>
       </table>
@@ -437,6 +451,56 @@ tr:hover{background:rgba(127,127,127,.04)}
 </div>
 
 <div class="toast" id="toast"></div>
+
+<!-- 余额配置弹窗 -->
+<div id="balModal" class="bal-overlay" onclick="if(event.target===this)closeBalModal()">
+  <div class="bal-dialog">
+    <div class="bal-head">
+      <span id="balModalTitle">余额查询配置</span>
+      <button class="icon-btn" onclick="closeBalModal()">✕</button>
+    </div>
+    <div class="bal-body">
+      <label class="bal-label">上游类型</label>
+      <select id="balType" class="bal-input" onchange="onBalTypeChange()">
+        <option value="">未启用</option>
+        <option value="sub2api">sub2api</option>
+        <option value="newapi">newapi</option>
+      </select>
+
+      <div id="balFields" style="display:none">
+        <label class="bal-label">站点地址（域名）</label>
+        <input id="balUrl" class="bal-input" placeholder="https://example.com">
+
+        <!-- sub2api: RT 优先 -->
+        <div class="bal-grp" data-grp="sub2api">
+          <label class="bal-label">Refresh Token (RT)<span class="bal-hint">推荐：直接填 RT</span></label>
+          <input id="balRt" class="bal-input" placeholder="eyJ... (可留空改用账号密码)">
+          <div class="bal-or">或使用账号密码</div>
+          <label class="bal-label">邮箱</label>
+          <input id="balAccountS" class="bal-input" placeholder="账号邮箱">
+          <label class="bal-label">密码</label>
+          <input id="balPasswordS" class="bal-input" type="password" placeholder="密码">
+        </div>
+
+        <!-- newapi: 账号密码 -->
+        <div class="bal-grp" data-grp="newapi">
+          <label class="bal-label">用户名</label>
+          <input id="balAccountN" class="bal-input" placeholder="登录用户名">
+          <label class="bal-label">密码</label>
+          <input id="balPasswordN" class="bal-input" type="password" placeholder="密码">
+        </div>
+      </div>
+
+      <div id="balResult" class="bal-result"></div>
+    </div>
+    <div class="bal-foot">
+      <button class="btn btn-ghost btn-sm" onclick="closeBalModal()">取消</button>
+      <button class="btn btn-ghost btn-sm" id="balTestBtn" onclick="saveAndTestBalance()">保存并测试</button>
+      <button class="btn btn-sm" onclick="saveBalanceConfig(true)">保存</button>
+    </div>
+  </div>
+</div>
+
 
 <script>
 const API = '';
@@ -776,11 +840,26 @@ function renderTrend(series) {
 }
 
 // ── Channel status monitor ──
+let lastBalances = {};
 async function loadChannelStatus() {
   try {
-    const resp = await apiFetch('/api/channel-status?minutes=60');
-    renderChannelStatus(await resp.json());
+    const [statusR, balR] = await Promise.all([
+      apiFetch('/api/channel-status?minutes=60'),
+      apiFetch('/api/channels/balances').catch(() => null),
+    ]);
+    if (balR) { try { lastBalances = await balR.json(); } catch(e) {} }
+    renderChannelStatus(await statusR.json());
   } catch(e) { console.error('Channel status error:', e); }
+}
+async function refreshCardBalance(id, btn) {
+  btn.disabled = true; btn.textContent = '…';
+  try {
+    const r = await (await apiFetch('/api/channels/' + id + '/balance/refresh', {method:'POST'})).json();
+    lastBalances[id] = { ...(lastBalances[id] || {}), configured: true,
+      value: r.value, error: r.error || '', checked_at: r.checked_at };
+    toast(r.error ? ('查询失败: ' + r.error) : ('余额 $' + Number(r.value).toFixed(2)));
+  } catch(e) { toast('刷新失败'); }
+  loadChannelStatus();
 }
 function renderChannelStatus(data) {
   const wrap = document.getElementById('channelStatus');
@@ -835,6 +914,25 @@ function renderChannelStatus(data) {
     const key = pct === null ? 'none' : (pct >= 95 ? 'green' : (pct >= 90 ? 'yellow' : 'red'));
     const st = STATUS[key];
     const palette = colors[i % colors.length];
+    const bal = lastBalances[id] || {};
+    let balHtml = '';
+    if (bal.configured) {
+      let balInner;
+      if (bal.error) {
+        balInner = `<span style="color:var(--accent4)" title="${escapeAttr(bal.error)}">查询失败</span>`;
+      } else if (bal.value !== null && bal.value !== undefined) {
+        balInner = `<b style="color:var(--accent2);font-size:15px">$${Number(bal.value).toFixed(2)}</b>`;
+      } else {
+        balInner = '<span style="color:var(--text2)">待刷新</span>';
+      }
+      balHtml = `
+      <div class="cs-avail" style="border-top:1px dashed var(--border);margin-top:10px;padding-top:10px">
+        <span class="al">账号余额 · ${bal.type}${bal.checked_at ? ' · ' + bal.checked_at.slice(5, 16) : ''}</span>
+        <span style="display:flex;align-items:center;gap:8px">${balInner}
+          <button class="icon-btn" style="width:26px;height:26px;font-size:12px" title="刷新余额" onclick="refreshCardBalance(${id}, this)">↻</button>
+        </span>
+      </div>`;
+    }
     const card = document.createElement('div');
     card.className = 'cs-card';
     card.innerHTML = `
@@ -865,6 +963,7 @@ function renderChannelStatus(data) {
         <span class="al">可用性 · 近 60 分</span>
         <span class="av" style="color:${st.c}">${pct === null ? '—' : pct.toFixed(2)}<small>${pct === null ? '' : '%'}</small></span>
       </div>
+      ${balHtml}
       <div class="cs-striprow"><span>近 60 分钟</span><span>${refreshLbl}</span></div>
       <div class="cs-bars">${barsHtml}</div>
       <div class="cs-foot"><span>PAST</span><span>NOW</span></div>`;
@@ -906,20 +1005,122 @@ function bindCsTooltip(host) {
 async function loadChannels() {
   const resp = await apiFetch('/api/channels');
   const channels = await resp.json();
+  let balances = {};
+  try { balances = await (await apiFetch('/api/channels/balances')).json(); } catch(e) {}
   const tbody = document.getElementById('channelsBody');
   tbody.innerHTML = '';
   channels.forEach(ch => {
+    const b = balances[ch.id] || {};
+    let balCell;
+    if (!b.configured) {
+      balCell = '<span style="color:var(--text2)">未配置</span>';
+    } else if (b.error) {
+      balCell = `<span style="color:var(--accent4)" title="${escapeAttr(b.error)}">⚠ 失败</span>`;
+    } else if (b.value !== null && b.value !== undefined) {
+      balCell = `<b style="color:var(--accent2)">$${Number(b.value).toFixed(2)}</b> <span style="color:var(--text2);font-size:11px">${b.type}</span>`;
+    } else {
+      balCell = `<span style="color:var(--text2)">${b.type} · 待刷新</span>`;
+    }
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${ch.id}</td>
       <td><input class="name-input" value="${ch.name}" onchange="updateChannel(${ch.id}, 'name', this.value)"></td>
       <td><input class="rate-input" type="number" step="0.001" value="${ch.rate}" onchange="updateChannel(${ch.id}, 'rate', this.value)"></td>
+      <td>${balCell}</td>
       <td style="color:var(--text2)">${ch.updated_at || ''}</td>
-      <td><button class="btn btn-danger btn-sm" onclick="deleteChannel(${ch.id})">删除</button></td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-ghost btn-sm" onclick="openBalModal(${ch.id}, '${escapeAttr(ch.name || ('渠道 ' + ch.id))}')">余额配置</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteChannel(${ch.id})">删除</button>
+      </td>
     `;
     tbody.appendChild(tr);
   });
   loadRateHistory();
+}
+
+function escapeAttr(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+}
+
+// ── Balance config modal ──
+let balModalChId = null;
+async function openBalModal(id, name) {
+  balModalChId = id;
+  document.getElementById('balModalTitle').textContent = `余额查询 · ${name}`;
+  document.getElementById('balResult').textContent = '';
+  // reset fields
+  ['balUrl','balRt','balAccountS','balPasswordS','balAccountN','balPasswordN'].forEach(i => document.getElementById(i).value = '');
+  document.getElementById('balType').value = '';
+  try {
+    const cfg = await (await apiFetch('/api/channels/' + id + '/balance-config')).json();
+    document.getElementById('balType').value = cfg.bal_type || '';
+    document.getElementById('balUrl').value = cfg.bal_url || '';
+    if (cfg.bal_type === 'sub2api') {
+      document.getElementById('balRt').value = cfg.bal_rt || '';
+      document.getElementById('balAccountS').value = cfg.bal_account || '';
+      document.getElementById('balPasswordS').value = cfg.bal_password || '';
+    } else if (cfg.bal_type === 'newapi') {
+      document.getElementById('balAccountN').value = cfg.bal_account || '';
+      document.getElementById('balPasswordN').value = cfg.bal_password || '';
+    }
+  } catch(e) {}
+  onBalTypeChange();
+  document.getElementById('balModal').classList.add('show');
+}
+function closeBalModal() {
+  document.getElementById('balModal').classList.remove('show');
+  balModalChId = null;
+}
+function onBalTypeChange() {
+  const t = document.getElementById('balType').value;
+  document.getElementById('balFields').style.display = t ? 'block' : 'none';
+  document.querySelectorAll('#balFields .bal-grp').forEach(g => {
+    g.classList.toggle('show', g.dataset.grp === t);
+  });
+}
+// Build the config payload from the form depending on selected type.
+function balPayload() {
+  const t = document.getElementById('balType').value;
+  const p = { bal_type: t, bal_url: document.getElementById('balUrl').value.trim(),
+              bal_account: '', bal_password: '', bal_rt: '' };
+  if (t === 'sub2api') {
+    p.bal_rt = document.getElementById('balRt').value.trim();
+    p.bal_account = document.getElementById('balAccountS').value.trim();
+    p.bal_password = document.getElementById('balPasswordS').value;
+  } else if (t === 'newapi') {
+    p.bal_account = document.getElementById('balAccountN').value.trim();
+    p.bal_password = document.getElementById('balPasswordN').value;
+  }
+  return p;
+}
+async function saveBalanceConfig(closeAfter) {
+  if (balModalChId == null) return;
+  const p = balPayload();
+  await apiFetch('/api/channels/' + balModalChId + '/balance-config',
+    {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(p)});
+  toast('配置已保存');
+  if (closeAfter) { closeBalModal(); loadChannels(); }
+}
+async function saveAndTestBalance() {
+  if (balModalChId == null) return;
+  const btn = document.getElementById('balTestBtn');
+  const res = document.getElementById('balResult');
+  btn.disabled = true;
+  res.innerHTML = '<span style="color:var(--text2)">正在保存并查询…</span>';
+  try {
+    await saveBalanceConfig(false);
+    const r = await (await apiFetch('/api/channels/' + balModalChId + '/balance/refresh', {method:'POST'})).json();
+    if (r.error) {
+      res.innerHTML = `<span style="color:var(--accent4)">✕ ${escapeAttr(r.error)}</span>`;
+    } else {
+      res.innerHTML = `<span style="color:var(--accent2)">✓ 当前余额 $${Number(r.value).toFixed(2)}</span> <span style="color:var(--text2)">(${r.checked_at})</span>`;
+      loadChannels();
+    }
+  } catch(e) {
+    res.innerHTML = '<span style="color:var(--accent4)">✕ 请求失败</span>';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 async function loadRateHistory() {

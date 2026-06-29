@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewAPI Monitor — settings stored here, also persisted to SQLite."""
-import os, json, sqlite3, glob, secrets, hashlib, hmac, time, urllib.request
+import os, json, sqlite3, glob, secrets, hashlib, hmac, time, urllib.request, urllib.error, http.cookiejar
 import psutil
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -131,6 +131,22 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
         """)
+        # Balance-check columns (added incrementally; ignore if already present).
+        # bal_type: '' | 'sub2api' | 'newapi'; credentials stored in plaintext (self-hosted tool).
+        for col, decl in [
+            ("bal_type", "TEXT DEFAULT ''"),
+            ("bal_url", "TEXT DEFAULT ''"),
+            ("bal_account", "TEXT DEFAULT ''"),
+            ("bal_password", "TEXT DEFAULT ''"),
+            ("bal_rt", "TEXT DEFAULT ''"),
+            ("bal_value", "REAL"),
+            ("bal_checked_at", "TEXT DEFAULT ''"),
+            ("bal_error", "TEXT DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE channels ADD COLUMN {col} {decl}")
+            except sqlite3.OperationalError:
+                pass  # column already exists
         # Seed default channels if empty
         row = conn.execute("SELECT count(*) FROM channels").fetchone()
         if row[0] == 0:
@@ -407,6 +423,162 @@ def get_rates():
         rows = conn.execute("SELECT id, name, rate FROM channels ORDER BY id").fetchall()
         return {r["id"]: {"name": r["name"], "rate": r["rate"]} for r in rows}
 
+# ── 渠道余额查询（上游 sub2api / newapi）──
+# 凭据以明文存于 channels 表（自托管个人工具）。两种上游最终都换算为 USD 余额。
+BALANCE_HTTP_TIMEOUT = 15
+
+def _api_err(body, status, prefix):
+    """Build a readable error message from an upstream JSON body / status."""
+    msg = ""
+    if isinstance(body, dict):
+        msg = body.get("message") or body.get("msg") or body.get("error") or ""
+    return f"{prefix}: {msg or ('HTTP ' + str(status))}"
+
+def _http_request(method, url, headers=None, body=None, opener=None):
+    """HTTP request returning (status, parsed_json_or_text). body dict -> JSON.
+    HTTPError is captured (so 4xx bodies are still parsed); network errors raise."""
+    data = None
+    h = dict(headers or {})
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        h.setdefault("Content-Type", "application/json")
+    h.setdefault("User-Agent", "newapi-monitor/1.0")
+    req = urllib.request.Request(url, data=data, method=method, headers=h)
+    o = opener or urllib.request.build_opener()
+    try:
+        resp = o.open(req, timeout=BALANCE_HTTP_TIMEOUT)
+        raw, status = resp.read().decode("utf-8", "replace"), resp.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read().decode("utf-8", "replace"), e.code
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        parsed = raw
+    return status, parsed
+
+def _fetch_sub2api(base, account, password, rt):
+    """Return (balance_usd, new_rt). Prefers RT (refresh -> AT -> /auth/me);
+    falls back to email+password login (which already returns balance)."""
+    base = base.rstrip("/")
+    api = base if base.endswith("/api/v1") else base + "/api/v1"
+    new_rt, access = rt, None
+    if rt:
+        st, body = _http_request("POST", api + "/auth/refresh", body={"refresh_token": rt})
+        if st == 200 and isinstance(body, dict) and body.get("code") == 0:
+            d = body.get("data") or {}
+            access = d.get("access_token")
+            new_rt = d.get("refresh_token") or rt
+        else:
+            raise RuntimeError(_api_err(body, st, "RT 刷新失败"))
+    elif account and password:
+        st, body = _http_request("POST", api + "/auth/login",
+                                 body={"email": account, "password": password, "turnstile_token": ""})
+        if st == 200 and isinstance(body, dict) and body.get("code") == 0:
+            d = body.get("data") or {}
+            if d.get("requires_2fa"):
+                raise RuntimeError("账号开启了 2FA，请改用 RT 方式")
+            new_rt = d.get("refresh_token") or rt
+            user = d.get("user") or {}
+            if user.get("balance") is not None:  # login already returns balance
+                return float(user["balance"]), new_rt
+            access = d.get("access_token")
+        else:
+            raise RuntimeError(_api_err(body, st, "登录失败"))
+    else:
+        raise RuntimeError("未配置 RT 或账号密码")
+    if not access:
+        raise RuntimeError("未获取到 access_token")
+    st, body = _http_request("GET", api + "/auth/me", headers={"Authorization": "Bearer " + access})
+    if st == 200 and isinstance(body, dict) and body.get("code") == 0:
+        d = body.get("data") or {}
+        if d.get("balance") is not None:
+            return float(d["balance"]), new_rt
+        raise RuntimeError("返回中无 balance 字段")
+    raise RuntimeError(_api_err(body, st, "获取余额失败"))
+
+def _fetch_newapi(base, account, password):
+    """Return balance_usd. Login (new-api-user:-1) -> session cookie + user id ->
+    /api/user/self -> quota; balance = quota / QUOTA_PER_USD (= quota * 0.000002)."""
+    base = base.rstrip("/")
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    st, body = _http_request("POST", base + "/api/user/login?turnstile=",
+                             headers={"new-api-user": "-1"},
+                             body={"username": account, "password": password}, opener=opener)
+    if not (st == 200 and isinstance(body, dict) and body.get("success")):
+        raise RuntimeError(_api_err(body, st, "登录失败"))
+    uid = (body.get("data") or {}).get("id")
+    if uid is None:
+        raise RuntimeError("登录返回中无用户 id")
+    st, body = _http_request("GET", base + "/api/user/self",
+                             headers={"new-api-user": str(uid)}, opener=opener)
+    if not (st == 200 and isinstance(body, dict) and body.get("success")):
+        raise RuntimeError(_api_err(body, st, "获取额度失败"))
+    quota = (body.get("data") or {}).get("quota")
+    if quota is None:
+        raise RuntimeError("返回中无 quota 字段")
+    return float(quota) / QUOTA_PER_USD
+
+def fetch_balance(cfg):
+    """cfg: dict-like with bal_type/bal_url/bal_account/bal_password/bal_rt.
+    Returns (value, error, new_rt): on success error is None; on failure value is None."""
+    t = (cfg.get("bal_type") or "").strip()
+    url = (cfg.get("bal_url") or "").strip()
+    rt = cfg.get("bal_rt") or ""
+    if not t or not url:
+        return None, "未配置", rt
+    try:
+        if t == "sub2api":
+            val, new_rt = _fetch_sub2api(url, cfg.get("bal_account") or "",
+                                         cfg.get("bal_password") or "", rt)
+            return val, None, new_rt
+        if t == "newapi":
+            return _fetch_newapi(url, cfg.get("bal_account") or "", cfg.get("bal_password") or ""), None, rt
+        return None, f"未知类型: {t}", rt
+    except Exception as e:
+        return None, str(e), rt
+
+def _save_balance_result(ch_id, value, error, new_rt):
+    """Persist a fetch result to the channel row. Returns the check timestamp string."""
+    now = now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE channels SET bal_value = ?, bal_error = ?, bal_checked_at = ?, bal_rt = ? WHERE id = ?",
+            (value, error or "", now, new_rt or "", ch_id),
+        )
+        conn.commit()
+    return now
+
+def refresh_channel_balance(ch_id):
+    """Live-fetch one channel's balance and persist the result. Returns a result dict or None."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, bal_type, bal_url, bal_account, bal_password, bal_rt FROM channels WHERE id = ?",
+            (ch_id,),
+        ).fetchone()
+    if not row:
+        return None
+    value, error, new_rt = fetch_balance(dict(row))
+    checked = _save_balance_result(ch_id, value, error, new_rt)
+    return {"id": ch_id, "value": value, "error": error or None, "checked_at": checked}
+
+def refresh_all_balances():
+    """Refresh every channel that has balance-checking configured. Returns list of results."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id FROM channels WHERE COALESCE(bal_type,'') != '' AND COALESCE(bal_url,'') != ''"
+        ).fetchall()
+    results = []
+    for r in rows:
+        try:
+            res = refresh_channel_balance(r["id"])
+            if res:
+                results.append(res)
+        except Exception as e:
+            print(f"[balance] channel {r['id']} refresh error: {e}", flush=True)
+    return results
+
+
 # ── Snapshot helpers ──
 def save_hourly_snapshot(start_dt, channels_data, total_real, total_usd, total_calls):
     snap = {
@@ -504,6 +676,13 @@ class ChannelCreate(BaseModel):
     name: str = ""
     rate: float = 0.0
 
+class BalanceConfigBody(BaseModel):
+    bal_type: str = ""          # '' | 'sub2api' | 'newapi'
+    bal_url: str = ""
+    bal_account: str = ""
+    bal_password: str = ""
+    bal_rt: str = ""
+
 class CostRecordBody(BaseModel):
     type: str           # 'income' or 'expense'
     amount: float
@@ -562,6 +741,68 @@ def api_delete_channel(ch_id: int):
         conn.execute("DELETE FROM channels WHERE id = ?", (ch_id,))
         conn.commit()
     return {"ok": True}
+
+# ── 渠道余额：配置 + 刷新 ──
+@app.get("/api/channels/{ch_id}/balance-config", dependencies=[Depends(require_session)])
+def api_get_balance_config(ch_id: int):
+    """Return one channel's balance-check config (admin only — includes credentials)."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT bal_type, bal_url, bal_account, bal_password, bal_rt FROM channels WHERE id = ?",
+            (ch_id,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "Channel not found")
+    return dict(row)
+
+@app.put("/api/channels/{ch_id}/balance-config", dependencies=[Depends(require_session)])
+def api_set_balance_config(ch_id: int, body: BalanceConfigBody):
+    t = body.bal_type.strip()
+    if t not in ("", "sub2api", "newapi"):
+        raise HTTPException(400, "类型必须是 sub2api 或 newapi")
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM channels WHERE id = ?", (ch_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Channel not found")
+        conn.execute(
+            "UPDATE channels SET bal_type = ?, bal_url = ?, bal_account = ?, "
+            "bal_password = ?, bal_rt = ? WHERE id = ?",
+            (t, body.bal_url.strip(), body.bal_account.strip(),
+             body.bal_password, body.bal_rt.strip(), ch_id),
+        )
+        conn.commit()
+    return {"ok": True}
+
+@app.post("/api/channels/{ch_id}/balance/refresh", dependencies=[Depends(require_session)])
+def api_refresh_channel_balance(ch_id: int):
+    """Live-fetch one channel's balance (login/refresh upstream) and cache the result."""
+    res = refresh_channel_balance(ch_id)
+    if res is None:
+        raise HTTPException(404, "Channel not found")
+    return res
+
+@app.get("/api/channels/balances", dependencies=[Depends(require_auth)])
+def api_get_balances():
+    """Cached balances for the dashboard. Credentials are NOT included."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, bal_type, bal_value, bal_checked_at, bal_error FROM channels ORDER BY id"
+        ).fetchall()
+    out = {}
+    for r in rows:
+        out[str(r["id"])] = {
+            "type": r["bal_type"] or "",
+            "configured": bool(r["bal_type"]),
+            "value": r["bal_value"],
+            "checked_at": r["bal_checked_at"] or "",
+            "error": r["bal_error"] or "",
+        }
+    return out
+
+@app.post("/api/channels/balances/refresh", dependencies=[Depends(require_session)])
+def api_refresh_all_balances():
+    """Refresh all configured channels' balances now."""
+    return {"ok": True, "results": refresh_all_balances()}
 
 @app.get("/api/hourly", dependencies=[Depends(require_auth)])
 def api_hourly():
@@ -1249,6 +1490,20 @@ def _run_error_monitor():
         except Exception as e:
             print(f"[ErrorMonitor] error: {e}", flush=True)
 
+BALANCE_REFRESH_SECS = 600  # 后台每 10 分钟刷新一次各渠道余额
+
+def _run_balance_poller():
+    """Refresh configured channels' balances shortly after startup, then every 10 minutes."""
+    time.sleep(30)  # let startup settle before the first (network) refresh
+    while True:
+        try:
+            results = refresh_all_balances()
+            if results:
+                print(f"[balance] refreshed {len(results)} channel(s)", flush=True)
+        except Exception as e:
+            print(f"[balance] poller error: {e}", flush=True)
+        time.sleep(BALANCE_REFRESH_SECS)
+
 @app.on_event("startup")
 def _on_startup():
     try:
@@ -1266,6 +1521,7 @@ def _on_startup():
     import threading
     threading.Thread(target=_run_scheduler, daemon=True).start()
     threading.Thread(target=_run_error_monitor, daemon=True).start()
+    threading.Thread(target=_run_balance_poller, daemon=True).start()
     print("[Startup] scheduler started", flush=True)
 
 # ── Static files & main page ──
