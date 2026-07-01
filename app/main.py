@@ -828,10 +828,15 @@ class ChannelStatusBody(BaseModel):
 
 @app.post("/api/channels/{ch_id}/status", dependencies=[Depends(require_session)])
 def api_set_channel_status(ch_id: int, body: ChannelStatusBody):
-    """Enable (1) or disable (2) a channel on new-api via admin access-token."""
+    """Enable (1) or disable (2) a channel on new-api via admin access-token.
+    Uses PUT /api/channel/ with {id, status} — the exact call new-api's own
+    frontend makes for enable/disable. GORM updates only non-zero fields, so
+    the channel's other config is untouched. (The dedicated POST
+    /api/channel/:id/status route only exists on newer new-api builds and
+    returns 'Invalid URL' on older ones like the documented Apifox version.)"""
     if body.status not in (1, 2):
         raise HTTPException(400, "status 必须为 1（启用）或 2（暂停）")
-    st, resp = _newapi_call("POST", f"/api/channel/{ch_id}/status", body={"status": body.status})
+    st, resp = _newapi_call("PUT", "/api/channel/", body={"id": ch_id, "status": body.status})
     if st != 200 or not isinstance(resp, dict) or not resp.get("success"):
         raise HTTPException(502, _api_err(resp, st, "调用 new-api 失败"))
     return {"ok": True, "enabled": body.status == 1}
@@ -1200,8 +1205,10 @@ def api_test_webhook():
 # ── new-api 渠道启停控制（管理员 access_token）──
 # 全局凭据存于 settings：newapi_control_url / newapi_control_token / newapi_control_user
 # 调用链：Authorization: <access_token>  +  new-api-user: <user_id>
-# 全部渠道状态用 GET /api/channel/?p=1&page_size=999 拉取（page_size 上限 100，
-# 因此翻页收集）；单渠道状态切换用 POST /api/channel/{id}/status，body {"status":1|2}。
+# 全部渠道状态用 GET /api/channel/?p=1&page_size=100 翻页拉取；单渠道启停用
+# PUT /api/channel/，body {"id":ch_id,"status":1|2}（与 new-api 官方前端一致）。
+# 注：新版源码另有 POST /api/channel/{id}/status 子路由，但旧版（Apifox 文档版）
+# 无此路由会返回 "Invalid URL"；PUT 方式新旧版通用。
 def _control_settings():
     """Return (url, token, user_id) or (None, None, None) when not configured."""
     url = (get_setting("newapi_control_url") or "").strip()
