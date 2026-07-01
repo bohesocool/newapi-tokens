@@ -891,10 +891,16 @@ async function toggleChannelStatus(id, enable, btn) {
   if (!controlConfigured) { toast('请先在设置页配置 new-api 控制凭据'); return; }
   btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
   try {
-    const r = await (await apiFetch('/api/channels/' + id + '/status', {
+    const resp = await apiFetch('/api/channels/' + id + '/status', {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({status: enable ? 1 : 2}),
-    })).json();
+    });
+    const r = await resp.json();
+    if (!resp.ok || !r.ok) {
+      // 后端调用 new-api 失败 —— 如实报错，不再假报“已启用/已暂停”
+      toast(r.detail || ('操作失败 (HTTP ' + resp.status + ')'));
+      return;
+    }
     lastControlStatus[id] = !!r.enabled;
     toast(enable ? '渠道已启用' : '渠道已暂停');
   } catch(e) {
