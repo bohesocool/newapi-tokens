@@ -573,19 +573,77 @@ def fetch_balance(cfg):
     except Exception as e:
         return None, str(e), rt
 
-def _save_balance_result(ch_id, value, error, new_rt):
-    """Persist a fetch result to the channel row. Returns the check timestamp string."""
+def _balance_url_groups():
+    """Group all channels with a bal_url by normalized URL (trailing slash trimmed).
+
+    Returns {normalized_url: [row_dict, ...]} with each group's rows sorted so the
+    best candidate to query upstream comes first: prefer rows whose bal_type is set
+    AND that carry credentials (account/password/rt), then rows whose bal_type is set,
+    then any. Same-bal_url channels are treated as one upstream account — each upstream
+    is queried once and the result is shared to the whole group."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, bal_type, bal_url, bal_account, bal_password, bal_rt FROM channels "
+            "WHERE COALESCE(bal_url,'') != ''"
+        ).fetchall()
+    rows = [dict(r) for r in rows]
+    groups: dict = {}
+    for r in rows:
+        norm = (r["bal_url"] or "").strip().rstrip("/")
+        if not norm:
+            continue
+        groups.setdefault(norm, []).append(r)
+
+    def has_creds(r):
+        return bool((r["bal_account"] or "").strip()
+                    or (r["bal_password"] or "").strip()
+                    or (r["bal_rt"] or "").strip())
+    for members in groups.values():
+        members.sort(key=lambda r: (
+            0 if (r["bal_type"] or "").strip() and has_creds(r)
+            else (1 if (r["bal_type"] or "").strip() else 2),
+            r["id"],
+        ))
+    return groups
+
+def _apply_balance_to_group(members, value, error, new_rt):
+    """Persist a fetched balance to a URL group. The representative (members[0]) keeps
+    its own RT updated; peers get value/error/checked_at only — their credentials are
+    left untouched (we never copy account/password/RT across channels). If a peer has
+    no bal_type while the rep does, the rep's type is filled in so the peer reads as
+    configured. Returns the shared 'now' timestamp string."""
+    err_str = error or ""
     now = now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
+    rep_type = (members[0]["bal_type"] or "").strip()
     with get_db() as conn:
         conn.execute(
-            "UPDATE channels SET bal_value = ?, bal_error = ?, bal_checked_at = ?, bal_rt = ? WHERE id = ?",
-            (value, error or "", now, new_rt or "", ch_id),
+            "UPDATE channels SET bal_value = ?, bal_error = ?, bal_checked_at = ?, bal_rt = ? "
+            "WHERE id = ?",
+            (value, err_str, now, new_rt or "", members[0]["id"]),
         )
+        for m in members[1:]:
+            peer_type = (m["bal_type"] or "").strip()
+            if rep_type and not peer_type:
+                conn.execute(
+                    "UPDATE channels SET bal_value = ?, bal_error = ?, bal_checked_at = ?, bal_type = ? "
+                    "WHERE id = ?",
+                    (value, err_str, now, rep_type, m["id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE channels SET bal_value = ?, bal_error = ?, bal_checked_at = ? WHERE id = ?",
+                    (value, err_str, now, m["id"]),
+                )
         conn.commit()
     return now
 
 def refresh_channel_balance(ch_id):
-    """Live-fetch one channel's balance and persist the result. Returns a result dict or None."""
+    """Live-fetch one channel's balance and persist the result. Channels sharing the
+    same bal_url (after trimming a trailing slash) are treated as one upstream: the
+    group's representative — the same-URL channel with the most complete credentials —
+    is queried once and the result (value/error/checked_at) is written to every channel
+    in the group. Peers keep their own credentials untouched; only their bal_type is
+    inferred from the representative if it was blank. Returns a result dict or None."""
     with get_db() as conn:
         row = conn.execute(
             "SELECT id, bal_type, bal_url, bal_account, bal_password, bal_rt FROM channels WHERE id = ?",
@@ -593,24 +651,34 @@ def refresh_channel_balance(ch_id):
         ).fetchone()
     if not row:
         return None
-    value, error, new_rt = fetch_balance(dict(row))
-    checked = _save_balance_result(ch_id, value, error, new_rt)
-    return {"id": ch_id, "value": value, "error": error or None, "checked_at": checked}
+    norm = ((row["bal_url"] or "").strip()).rstrip("/")
+    members = _balance_url_groups().get(norm)
+    if not members:
+        # No bal_url on this channel (or none share it) — refresh it alone in place.
+        value, error, new_rt = fetch_balance(dict(row))
+        now = now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE channels SET bal_value = ?, bal_error = ?, bal_checked_at = ?, bal_rt = ? WHERE id = ?",
+                (value, error or "", now, new_rt or "", ch_id),
+            )
+            conn.commit()
+        return {"id": ch_id, "value": value, "error": error or None, "checked_at": now}
+    value, error, new_rt = fetch_balance(dict(members[0]))
+    now = _apply_balance_to_group(members, value, error, new_rt)
+    return {"id": ch_id, "value": value, "error": error or None, "checked_at": now}
 
 def refresh_all_balances():
-    """Refresh every channel that has balance-checking configured. Returns list of results."""
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id FROM channels WHERE COALESCE(bal_type,'') != '' AND COALESCE(bal_url,'') != ''"
-        ).fetchall()
+    """Background poll: for each unique bal_url, query its representative channel once
+    and write the result to every channel in the group. Same-URL channels are never
+    queried separately, so N channels on one upstream cost one upstream request."""
+    groups = _balance_url_groups()
     results = []
-    for r in rows:
-        try:
-            res = refresh_channel_balance(r["id"])
-            if res:
-                results.append(res)
-        except Exception as e:
-            print(f"[balance] channel {r['id']} refresh error: {e}", flush=True)
+    for members in groups.values():
+        value, error, new_rt = fetch_balance(dict(members[0]))
+        now = _apply_balance_to_group(members, value, error, new_rt)
+        for m in members:
+            results.append({"id": m["id"], "value": value, "error": error or None, "checked_at": now})
     return results
 
 
@@ -871,7 +939,11 @@ def api_sync_channels():
     """Pull all channels from new-api and upsert into the local channels table.
     New channels are inserted with rate=0 (configure manually). For existing
     channels only the name is refreshed — rate / balance config are never touched.
-    Returns counts so the UI can report what changed."""
+    For NEW channels, bal_url is seeded from new-api's base_url (the channel's
+    upstream URL), so same-upstream channels can auto-group for balance checking
+    without you typing URLs by hand. For EXISTING channels whose bal_url is still
+    blank, the same seed is backfilled (never overwriting one you set manually).
+    Returns counts for the UI."""
     if not _control_settings()[0]:
         raise HTTPException(400, "未配置 new-api 控制凭据，无法同步")
     full = fetch_newapi_channels()
@@ -888,14 +960,24 @@ def api_sync_channels():
             except ValueError:
                 continue
             name = info.get("name") or ""
+            base_url = info.get("base_url") or ""
             if cid in existing:
                 if existing[cid] != name:
                     conn.execute("UPDATE channels SET name = ?, updated_at = ? WHERE id = ?",
                                  (name, now, cid))
                     renamed += 1
+                # 已有渠道若没手填 bal_url，用 new-api 的 base_url 补上，使同上游渠道
+                # 能自动并组查余额。已手填的 bal_url 不覆盖。
+                if base_url and not (conn.execute(
+                    "SELECT bal_url FROM channels WHERE id = ?", (cid,)
+                ).fetchone()["bal_url"] or "").strip():
+                    conn.execute("UPDATE channels SET bal_url = ? WHERE id = ?",
+                                 (base_url, cid))
             else:
-                conn.execute("INSERT INTO channels (id, name, rate) VALUES (?, ?, 0)",
-                             (cid, name))
+                # base_url 来自 new-api 渠道配置里的上游地址；为空时（指向内置
+                # 中转的渠道）bal_url 留空，该渠道不参与余额查询，直到你手填。
+                conn.execute("INSERT INTO channels (id, name, rate, bal_url) VALUES (?, ?, 0, ?)",
+                             (cid, name, info.get("base_url") or ""))
                 added += 1
         conn.commit()
     return {"ok": True, "added": added, "renamed": renamed,
@@ -1315,6 +1397,7 @@ def fetch_newapi_channels():
             out[str(cid)] = {
                 "name": ch.get("name") or "",
                 "enabled": (ch.get("status") == NA_STATUS_ENABLED),
+                "base_url": (ch.get("base_url") or "").strip(),
             }
         total = data.get("total") or 0
         if len(out) >= total or not items:
