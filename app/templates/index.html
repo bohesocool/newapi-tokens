@@ -398,6 +398,22 @@ tr:hover{background:rgba(127,127,127,.04)}
   <!-- Settings Tab -->
   <div id="tab-settings" style="display:none">
     <div class="card" style="max-width:760px">
+      <!-- new-api 渠道启停控制凭据 -->
+      <div class="set-section">
+        <div class="card-title"><span>new-api 渠道启停控制</span></div>
+        <div class="set-label">填入 new-api 管理员的「访问令牌 (access_token)」与「用户 ID」，即可在仪表盘卡片上直接启用 / 暂停渠道。三者均必填。</div>
+        <div class="set-row" style="flex-direction:column;align-items:stretch;gap:10px">
+          <input class="key-input" id="ctrlUrl" placeholder="new-api 站点地址（https://...）">
+          <input class="key-input" id="ctrlToken" type="password" placeholder="管理员 access_token（访问令牌，留空表示不修改）">
+          <input class="key-input" id="ctrlUser" placeholder="管理员用户 ID（数字）">
+          <div style="display:flex;gap:8px;align-items:center">
+            <button class="btn btn-sm" onclick="saveControl()">保存</button>
+            <span id="ctrlHint" class="set-hint" style="margin:0"></span>
+          </div>
+        </div>
+        <div class="set-hint">获取方式：登录 new-api → 个人设置 → 生成「访问令牌」；用户 ID 在用户管理页查看。令牌不回显，留空表示不修改。</div>
+      </div>
+
       <!-- API Key -->
       <div class="set-section">
         <div class="card-title"><span>API Key (外部调用鉴权)</span></div>
@@ -841,13 +857,23 @@ function renderTrend(series) {
 
 // ── Channel status monitor ──
 let lastBalances = {};
+let controlConfigured = false;   // new-api 启停控制是否已配置
+let lastControlStatus = {};      // {channel_id: enabled_bool}
 async function loadChannelStatus() {
   try {
-    const [statusR, balR] = await Promise.all([
+    const [statusR, balR, ctrlR] = await Promise.all([
       apiFetch('/api/channel-status?minutes=60'),
       apiFetch('/api/channels/balances').catch(() => null),
+      apiFetch('/api/channels/control-status').catch(() => null),
     ]);
     if (balR) { try { lastBalances = await balR.json(); } catch(e) {} }
+    if (ctrlR) {
+      try {
+        const c = await ctrlR.json();
+        controlConfigured = !!c.configured;
+        lastControlStatus = c.statuses || {};
+      } catch(e) {}
+    }
     renderChannelStatus(await statusR.json());
   } catch(e) { console.error('Channel status error:', e); }
 }
@@ -861,9 +887,28 @@ async function refreshCardBalance(id, btn) {
   } catch(e) { toast('刷新失败'); }
   loadChannelStatus();
 }
+async function toggleChannelStatus(id, enable, btn) {
+  if (!controlConfigured) { toast('请先在设置页配置 new-api 控制凭据'); return; }
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = '…';
+  try {
+    const r = await (await apiFetch('/api/channels/' + id + '/status', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({status: enable ? 1 : 2}),
+    })).json();
+    lastControlStatus[id] = !!r.enabled;
+    toast(enable ? '渠道已启用' : '渠道已暂停');
+  } catch(e) {
+    toast('操作失败');
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+  if (lastStatusData) renderChannelStatus(lastStatusData);
+}
+let lastStatusData = null;  // 缓存最近一份渠道状态，供启停后局部刷新重渲染
 function renderChannelStatus(data) {
   const wrap = document.getElementById('channelStatus');
   if (!wrap) return;
+  lastStatusData = data;
   const rpmEl = document.getElementById('curRpm');
   if (rpmEl) rpmEl.textContent = data.error ? '—' : (data.total_rpm || 0).toLocaleString();
   const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
@@ -915,6 +960,18 @@ function renderChannelStatus(data) {
     const st = STATUS[key];
     const palette = colors[i % colors.length];
     const bal = lastBalances[id] || {};
+    // new-api 启停控制：仅在配置了控制凭据时显示状态徽标与启停按钮
+    const ctrlKnown = controlConfigured && (id in lastControlStatus);
+    const enabled = !!lastControlStatus[id];
+    const ctrlBadge = ctrlKnown
+      ? `<span class="cs-badge2" style="background:${enabled ? 'rgba(16,185,129,.13)' : 'rgba(127,127,127,.14)'};color:${enabled ? 'var(--accent2)' : 'var(--text2)'}">${enabled ? '已启用' : '已暂停'}</span>`
+      : '';
+    const ctrlBtns = controlConfigured
+      ? `<div style="display:flex;gap:8px;margin-top:10px">
+           <button class="btn btn-sm" style="${enabled ? 'opacity:.45;pointer-events:none' : ''}" onclick="toggleChannelStatus(${id}, true, this)">启动</button>
+           <button class="btn btn-sm btn-ghost" style="${!enabled ? 'opacity:.45;pointer-events:none' : ''}" onclick="toggleChannelStatus(${id}, false, this)">暂停</button>
+         </div>`
+      : '';
     let balHtml = '';
     if (bal.configured) {
       let balInner;
@@ -940,6 +997,7 @@ function renderChannelStatus(data) {
         <span class="cs-ic" style="background:${st.bg};color:${st.c}">${st.glyph}</span>
         <span class="cs-title">${ch.name || '渠道 ' + id}</span>
         <span class="cs-badge2" style="background:${st.bg};color:${st.c}">${st.txt}</span>
+        ${ctrlBadge}
       </div>
       <div class="cs-tags">
         <span class="cs-tag" style="color:${palette}">#${id}</span>
@@ -964,6 +1022,7 @@ function renderChannelStatus(data) {
         <span class="av" style="color:${st.c}">${pct === null ? '—' : pct.toFixed(2)}<small>${pct === null ? '' : '%'}</small></span>
       </div>
       ${balHtml}
+      ${ctrlBtns}
       <div class="cs-striprow"><span>近 60 分钟</span><span>${refreshLbl}</span></div>
       <div class="cs-bars">${barsHtml}</div>
       <div class="cs-foot"><span>PAST</span><span>NOW</span></div>`;
@@ -1335,7 +1394,39 @@ async function loadSettings() {
     document.getElementById('apiKeyVal').value = currentApiKey;
     renderCurl();
     loadWebhook();
+    loadControl();
   } catch(e) { console.error(e); }
+}
+async function loadControl() {
+  try {
+    const resp = await apiFetch('/api/settings/control');
+    const d = await resp.json();
+    document.getElementById('ctrlUrl').value = d.url || '';
+    document.getElementById('ctrlToken').value = '';
+    document.getElementById('ctrlToken').placeholder = d.has_token
+      ? '已配置（留空表示不修改）'
+      : '管理员 access_token（访问令牌）';
+    document.getElementById('ctrlUser').value = d.user_id || '';
+    const hint = document.getElementById('ctrlHint');
+    if (hint) {
+      hint.textContent = d.configured ? '✓ 已配置' : '未配置';
+      hint.style.color = d.configured ? 'var(--accent2)' : 'var(--accent4)';
+    }
+  } catch(e) { console.error('Control load error:', e); }
+}
+async function saveControl() {
+  const body = {
+    url: document.getElementById('ctrlUrl').value,
+    user_id: document.getElementById('ctrlUser').value,
+  };
+  const tok = document.getElementById('ctrlToken').value;
+  if (tok) body.token = tok;
+  try {
+    await apiFetch('/api/settings/control', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    toast('控制凭据已保存');
+    loadControl();
+    loadChannelStatus();
+  } catch(e) { toast('保存失败'); }
 }
 function renderCurl() {
   const origin = location.origin;

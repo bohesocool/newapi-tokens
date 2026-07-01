@@ -814,6 +814,28 @@ def api_refresh_all_balances():
     """Refresh all configured channels' balances now."""
     return {"ok": True, "results": refresh_all_balances()}
 
+# ── 渠道启停控制（new-api 管理员 access_token）──
+@app.get("/api/channels/control-status", dependencies=[Depends(require_auth)])
+def api_get_control_status():
+    """Return {channel_id: enabled_bool} for all new-api channels, from the upstream."""
+    if not _control_settings()[0]:
+        return {"configured": False, "statuses": {}}
+    statuses = fetch_newapi_channel_status()
+    return {"configured": True, "statuses": statuses or {}, "error": statuses is None}
+
+class ChannelStatusBody(BaseModel):
+    status: int  # 1 = enable, 2 = disable (new-api manual disabled)
+
+@app.post("/api/channels/{ch_id}/status", dependencies=[Depends(require_session)])
+def api_set_channel_status(ch_id: int, body: ChannelStatusBody):
+    """Enable (1) or disable (2) a channel on new-api via admin access-token."""
+    if body.status not in (1, 2):
+        raise HTTPException(400, "status 必须为 1（启用）或 2（暂停）")
+    st, resp = _newapi_call("POST", f"/api/channel/{ch_id}/status", body={"status": body.status})
+    if st != 200 or not isinstance(resp, dict) or not resp.get("success"):
+        raise HTTPException(502, _api_err(resp, st, "调用 new-api 失败"))
+    return {"ok": True, "enabled": body.status == 1}
+
 @app.get("/api/hourly", dependencies=[Depends(require_auth)])
 def api_hourly():
     """Get current hour data (live query). Cached briefly so concurrent polls share one query."""
@@ -1089,6 +1111,12 @@ class WebhookBody(BaseModel):
     push_daily: Optional[bool] = None
     push_error: Optional[bool] = None
 
+class ControlConfigBody(BaseModel):
+    # new-api 管理员凭据，用于在仪表盘卡上启用/暂停渠道
+    url: Optional[str] = None
+    token: Optional[str] = None
+    user_id: Optional[str] = None
+
 @app.post("/api/login")
 def api_login(body: LoginBody, request: Request):
     ip = _client_ip(request)
@@ -1167,6 +1195,79 @@ def api_test_webhook():
     ok = push_webhook("test", "✅ NewAPI Monitor Webhook 测试消息", {"hello": "world"})
     if not ok:
         raise HTTPException(502, "推送失败，请检查 URL 是否可达")
+    return {"ok": True}
+
+# ── new-api 渠道启停控制（管理员 access_token）──
+# 全局凭据存于 settings：newapi_control_url / newapi_control_token / newapi_control_user
+# 调用链：Authorization: <access_token>  +  new-api-user: <user_id>
+# 全部渠道状态用 GET /api/channel/?p=1&page_size=999 拉取（page_size 上限 100，
+# 因此翻页收集）；单渠道状态切换用 POST /api/channel/{id}/status，body {"status":1|2}。
+def _control_settings():
+    """Return (url, token, user_id) or (None, None, None) when not configured."""
+    url = (get_setting("newapi_control_url") or "").strip()
+    token = (get_setting("newapi_control_token") or "").strip()
+    user_id = (get_setting("newapi_control_user") or "").strip()
+    if url and token and user_id:
+        return url, token, user_id
+    return None, None, None
+
+def _newapi_call(method, path, *, body=None):
+    """Call new-api control API with admin access-token auth. Returns (status, parsed)."""
+    url, token, user_id = _control_settings()
+    if not url:
+        return 0, {"error": "未配置 new-api 控制凭据"}
+    base = url.rstrip("/")
+    full = base + path
+    h = {"Authorization": token, "new-api-user": user_id}
+    return _http_request(method, full, headers=h, body=body)
+
+# new-api ChannelStatus: 1=enabled, 2=manual disabled, 3=auto disabled
+NA_STATUS_ENABLED = 1
+
+def fetch_newapi_channel_status():
+    """Return {channel_id: enabled_bool} for all channels, or None on failure.
+    new-api GET /api/channel/ is paged (page_size cap 100), so walk pages until
+    we've collected `total` items."""
+    out = {}
+    page = 1
+    while True:
+        st, body = _newapi_call("GET", f"/api/channel/?p={page}&page_size=100")
+        if st != 200 or not isinstance(body, dict) or not body.get("success"):
+            return None if not out else out
+        data = body.get("data") or {}
+        items = data.get("items") or []
+        for ch in items:
+            cid = ch.get("id")
+            if cid is None:
+                continue
+            out[str(cid)] = (ch.get("status") == NA_STATUS_ENABLED)
+        total = data.get("total") or 0
+        if len(out) >= total or not items:
+            break
+        page += 1
+    return out
+
+@app.get("/api/settings/control", dependencies=[Depends(require_session)])
+def api_get_control():
+    """Return new-api control config. Token is not echoed in full — only whether set."""
+    url = (get_setting("newapi_control_url") or "").strip()
+    token = (get_setting("newapi_control_token") or "").strip()
+    user_id = (get_setting("newapi_control_user") or "").strip()
+    return {
+        "url": url,
+        "has_token": bool(token),
+        "user_id": user_id,
+        "configured": bool(url and token and user_id),
+    }
+
+@app.post("/api/settings/control", dependencies=[Depends(require_session)])
+def api_set_control(body: ControlConfigBody):
+    if body.url is not None:
+        set_setting("newapi_control_url", body.url.strip())
+    if body.token is not None and body.token != "":
+        set_setting("newapi_control_token", body.token.strip())
+    if body.user_id is not None:
+        set_setting("newapi_control_user", body.user_id.strip())
     return {"ok": True}
 
 # ── Trend & rate history ──
