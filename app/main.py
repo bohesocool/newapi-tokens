@@ -396,17 +396,22 @@ def query_pg_rpm_by_model(start_ts, end_ts):
     """Trailing-window request count split by whether model_name marks a 'mini'
     model (ILIKE '%-mini%'). Returns (mini_count, other_count) or (None, None)
     on failure. Uses idx_created_at_type — the model_name filter is applied
-    after the same indexed range scan as the other log queries."""
+    after the same indexed range scan as the other log queries.
+
+    The ILIKE pattern is passed as a parameter, not inlined: psycopg2's mogrify
+    treats a literal '%-mini%' in the SQL string as '%-' format spec and raises
+    'unsupported format character '-'', so the query would always fail (-> 0,0).
+    """
     sql = """
 SELECT
-  count(*) FILTER (WHERE model_name ILIKE '%-mini%'),
-  count(*) FILTER (WHERE model_name NOT ILIKE '%-mini%')
+  count(*) FILTER (WHERE model_name ILIKE %s),
+  count(*) FILTER (WHERE model_name NOT ILIKE %s)
 FROM logs
 WHERE type IN (2, 5)
   AND token_name = %s
   AND created_at >= %s
   AND created_at < %s"""
-    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
     if rows is None:
         return None, None
     r = rows[0]
