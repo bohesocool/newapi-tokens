@@ -725,7 +725,7 @@ async function loadDashboard() {
       row.innerHTML = `
         <div class="ch-badge" style="background:${colors[i % colors.length]}20;color:${colors[i % colors.length]}">${ch.id}</div>
         <div class="ch-info">
-          <div class="ch-name">${ch.name || '渠道 ' + ch.id}</div>
+          <div class="ch-name">${escapeHtml(ch.name || '渠道 ' + ch.id)}</div>
           <div class="ch-stats">${(ch.calls||0).toLocaleString()} 次 · ${fmtNum(ch.prompt_tokens||0)}+${fmtNum(ch.completion_tokens||0)} tok${errHtml}</div>
         </div>
         <div class="ch-amount">
@@ -1018,7 +1018,7 @@ function renderChannelStatus(data) {
     card.innerHTML = `
       <div class="cs-top">
         <span class="cs-ic" style="background:${st.bg};color:${st.c}">${st.glyph}</span>
-        <span class="cs-title">${ch.name || '渠道 ' + id}</span>
+        <span class="cs-title">${escapeHtml(ch.name || '渠道 ' + id)}</span>
         <span class="cs-badge2" style="background:${st.bg};color:${st.c}">${st.txt}</span>
         ${ctrlBadge}
       </div>
@@ -1068,7 +1068,7 @@ function bindCsTooltip(host) {
   if (host._csBound) return;  // delegate once; host element is stable across refreshes
   host._csBound = true;
   const show = (bar) => {
-    _csTip.innerHTML = bar.dataset.tip;
+    _csTip.textContent = bar.dataset.tip;
     const r = bar.getBoundingClientRect();
     const x = r.left + r.width / 2, y = r.top - 10;
     _csTip.style.transform = `translate(${x}px, ${y}px) translate(-50%, -100%)`;
@@ -1106,7 +1106,7 @@ async function loadChannels() {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${ch.id}</td>
-      <td><input class="name-input" value="${ch.name}" onchange="updateChannel(${ch.id}, 'name', this.value)"></td>
+      <td><input class="name-input" value="${escapeAttr(ch.name)}" onchange="updateChannel(${ch.id}, 'name', this.value)"></td>
       <td><input class="rate-input" type="number" step="0.001" value="${ch.rate}" onchange="updateChannel(${ch.id}, 'rate', this.value)"></td>
       <td>${balCell}</td>
       <td style="color:var(--text2)">${ch.updated_at || ''}</td>
@@ -1121,7 +1121,7 @@ async function loadChannels() {
 }
 
 function escapeAttr(s) {
-  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ── Balance config modal ──
@@ -1193,9 +1193,9 @@ async function saveAndTestBalance() {
     await saveBalanceConfig(false);
     const r = await (await apiFetch('/api/channels/' + balModalChId + '/balance/refresh', {method:'POST'})).json();
     if (r.error) {
-      res.innerHTML = `<span style="color:var(--accent4)">✕ ${escapeAttr(r.error)}</span>`;
+      res.innerHTML = `<span style="color:var(--accent4)">✕ ${escapeHtml(r.error)}</span>`;
     } else {
-      res.innerHTML = `<span style="color:var(--accent2)">✓ 当前余额 $${Number(r.value).toFixed(2)}</span> <span style="color:var(--text2)">(${r.checked_at})</span>`;
+      res.innerHTML = `<span style="color:var(--accent2)">✓ 当前余额 $${Number(r.value).toFixed(2)}</span> <span style="color:var(--text2)">(${escapeHtml(r.checked_at)})</span>`;
       loadChannels();
     }
   } catch(e) {

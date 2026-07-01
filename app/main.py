@@ -15,6 +15,15 @@ from pydantic import BaseModel
 from typing import Optional
 from psycopg_pool import ConnectionPool
 
+try:
+    from .cache_utils import TTLResponseCache
+    from .report_text import build_daily_report_text, build_hourly_report_text
+    from .scheduler_lock import sqlite_lease
+except ImportError:
+    from cache_utils import TTLResponseCache
+    from report_text import build_daily_report_text, build_hourly_report_text
+    from scheduler_lock import sqlite_lease
+
 # ── Config ──
 SHANGHAI = timezone(timedelta(hours=8))
 BASE_DIR = Path(__file__).resolve().parent
@@ -59,19 +68,19 @@ def _pg_rows(sql, params=()):
 
 # Short-TTL cache so concurrent dashboard polls collapse into one PG query.
 DASH_CACHE_TTL = 10  # seconds
-_resp_cache = {}  # key -> (expires_ts, value)
+_resp_cache = TTLResponseCache()
 
 def cached_response(key, ttl, producer):
-    hit = _resp_cache.get(key)
-    if hit and hit[0] > time.time():
-        return hit[1]
-    val = producer()
-    _resp_cache[key] = (time.time() + ttl, val)
-    return val
+    return _resp_cache.get(key, ttl, producer)
+
+def invalidate_dashboard_cache():
+    _resp_cache.invalidate_prefix("hourly")
+    _resp_cache.invalidate_prefix("chstatus:")
 
 # 渠道错误率监控（可按需调整）
 ERROR_RATE_THRESHOLD = 0.10   # 错误率 ≥ 10% 触发告警
 ERROR_MIN_SAMPLE = 20         # 该分钟总调用 < 20 不参与判定，避免低流量误报
+INSTANCE_OWNER = f"{os.getpid()}:{secrets.token_hex(4)}"
 
 app = FastAPI(title="NewAPI Monitor")
 app.add_middleware(
@@ -376,46 +385,32 @@ ORDER BY channel_id, m"""
         }
     return out
 
-def query_pg_rpm(start_ts, end_ts):
-    """Per-channel request count (success type=2 + error type=5) for the token in
-    [start, end). Used for a trailing-60s RPM gauge. Returns {channel_id: count} or None."""
-    sql = """
-SELECT channel_id, count(*)
-FROM logs
-WHERE type IN (2, 5)
-  AND token_name = %s
-  AND created_at >= %s
-  AND created_at < %s
-GROUP BY channel_id"""
-    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
-    if rows is None:
-        return None
-    return {int(r[0]): int(r[1]) for r in rows}
-
-def query_pg_rpm_by_model(start_ts, end_ts):
-    """Trailing-window request count split by whether model_name marks a 'mini'
-    model (ILIKE '%-mini%'). Returns (mini_count, other_count) or (None, None)
-    on failure. Uses idx_created_at_type — the model_name filter is applied
-    after the same indexed range scan as the other log queries.
-
-    The ILIKE pattern is passed as a parameter, not inlined: psycopg2's mogrify
-    treats a literal '%-mini%' in the SQL string as '%-' format spec and raises
-    'unsupported format character '-'', so the query would always fail (-> 0,0).
-    """
+def query_pg_rpm_detail(start_ts, end_ts):
+    """Trailing-window request counts per channel plus mini/non-mini totals.
+    Keeps the RPM cards to one indexed Postgres range scan instead of two."""
     sql = """
 SELECT
+  channel_id,
+  count(*),
   count(*) FILTER (WHERE model_name ILIKE %s),
   count(*) FILTER (WHERE model_name NOT ILIKE %s)
 FROM logs
 WHERE type IN (2, 5)
   AND token_name = %s
   AND created_at >= %s
-  AND created_at < %s"""
+  AND created_at < %s
+GROUP BY channel_id"""
     rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
     if rows is None:
-        return None, None
-    r = rows[0]
-    return int(r[0]), int(r[1])
+        return None
+    rpm_map = {}
+    mini_count = 0
+    other_count = 0
+    for r in rows:
+        rpm_map[int(r[0])] = int(r[1])
+        mini_count += int(r[2])
+        other_count += int(r[3])
+    return rpm_map, mini_count, other_count
 
 def now_shanghai():
     return datetime.now(SHANGHAI)
@@ -825,6 +820,7 @@ def api_update_channel(ch_id: int, body: ChannelUpdate):
                     (ch_id, old_rate, body.rate, now_shanghai().strftime("%Y-%m-%d %H:%M:%S")),
                 )
             conn.commit()
+            invalidate_dashboard_cache()
     return {"ok": True}
 
 @app.post("/api/channels", dependencies=[Depends(require_auth)])
@@ -836,6 +832,7 @@ def api_create_channel(body: ChannelCreate):
             conn.commit()
         except sqlite3.IntegrityError:
             raise HTTPException(409, "Channel already exists")
+    invalidate_dashboard_cache()
     return {"ok": True}
 
 @app.delete("/api/channels/{ch_id}", dependencies=[Depends(require_auth)])
@@ -843,6 +840,7 @@ def api_delete_channel(ch_id: int):
     with get_db() as conn:
         conn.execute("DELETE FROM channels WHERE id = ?", (ch_id,))
         conn.commit()
+    invalidate_dashboard_cache()
     return {"ok": True}
 
 # ── 渠道余额：配置 + 刷新 ──
@@ -980,6 +978,7 @@ def api_sync_channels():
                              (cid, name, info.get("base_url") or ""))
                 added += 1
         conn.commit()
+    invalidate_dashboard_cache()
     return {"ok": True, "added": added, "renamed": renamed,
             "total": len(full)}
 
@@ -1111,12 +1110,12 @@ def _compute_channel_status(minutes):
                 "channels": {}, "error": True}
     # Trailing-60s request count per channel = current RPM (independent of the minute buckets).
     rpm_end = int(now.timestamp())
-    rpm_map = query_pg_rpm(rpm_end - 60, rpm_end) or {}
+    rpm_detail = query_pg_rpm_detail(rpm_end - 60, rpm_end)
+    if rpm_detail is None:
+        rpm_map, mini_rpm, other_rpm = {}, 0, 0
+    else:
+        rpm_map, mini_rpm, other_rpm = rpm_detail
     total_rpm = sum(rpm_map.values())
-    # Trailing-60s RPM split by model: mini vs non-mini (total RPM stays the sum above).
-    mini_rpm, other_rpm = query_pg_rpm_by_model(rpm_end - 60, rpm_end)
-    if mini_rpm is None:
-        mini_rpm, other_rpm = 0, 0
     bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
     bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
     bucket_lbl = [b.strftime("%m-%d %H:%M") for b in bucket_dts]
@@ -1162,6 +1161,7 @@ def api_snapshot_hourly():
         total_usd += d["usd"]
         total_calls += d["calls"]
     f = save_hourly_snapshot(start, ch_data, total_real, total_usd, total_calls)
+    invalidate_dashboard_cache()
     return {"ok": True, "snapshot": str(f), "total_real": total_real}
 
 @app.get("/api/daily/{date_str}", dependencies=[Depends(require_auth)])
@@ -1573,38 +1573,23 @@ def api_cost_weekly(weeks: int = 8):
     }
 
 # ── Report text builders & webhook push ──
-def _channel_report_lines(channels):
-    lines = ""
-    for ch_id, d in sorted(channels.items(), key=lambda x: int(x[0])):
-        usd = d.get("usd", 0) or 0
-        rate = (d.get("real_cost", 0) / usd) if usd > 0 else 0
-        name = d.get("name", "")
-        head = f"渠道 {ch_id}" + (f" ({name})" if name else "")
-        lines += f"\n\n📌 {head}（×{rate:.3f}）\n"
-        lines += f"  调用    {d.get('calls', 0):,} 次\n"
-        lines += f"  消费    ${usd:,.2f}\n"
-        lines += f"  实付    ${d.get('real_cost', 0):,.2f}\n"
-    return lines
-
 def build_hourly_report(start_dt):
     """Build hourly report text/data from the completed-hour snapshot. Returns (None, None) if missing."""
     f = SNAPSHOT_DIR / f"{start_dt.strftime('%Y-%m-%d')}_{start_dt.hour:02d}.json"
     if not f.exists():
         return None, None
     snap = json.loads(f.read_text(encoding="utf-8"))
-    end_dt = start_dt + timedelta(hours=1)
     rates = get_rates()
     channels = {cid: {**d, "name": rates.get(int(cid), {}).get("name", "")}
                 for cid, d in snap.get("channels", {}).items()}
-    text = (f"📊 NewAPI 消费小时报\n━━━━━━━━━━━━━━━━━\n"
-            f"⏰ 时段: {start_dt.strftime('%m-%d %H:%M')} → {end_dt.strftime('%m-%d %H:%M')}\n"
-            f"🔑 令牌: {TOKEN_NAME}\n━━━━━━━━━━━━━━━━━")
-    text += _channel_report_lines(channels)
-    text += "\n\n━━━━━━━━━━━━━━━━━\n"
-    text += f"💎 本小时实付  ${snap.get('total_real', 0):,.2f}\n"
-    text += f"📊 本小时消费  ${snap.get('total_usd', 0):,.2f}\n"
-    text += f"📞 本小时调用  {snap.get('total_calls', 0):,} 次\n"
-    text += "━━━━━━━━━━━━━━━━━"
+    text = build_hourly_report_text(
+        start_dt,
+        TOKEN_NAME,
+        channels,
+        snap.get("total_real", 0),
+        snap.get("total_usd", 0),
+        snap.get("total_calls", 0),
+    )
     data = {"channels": snap.get("channels", {}),
             "total_real": snap.get("total_real", 0),
             "total_usd": snap.get("total_usd", 0),
@@ -1625,20 +1610,41 @@ def build_daily_report(date_str):
     rates = get_rates()
     for cid, d in channels.items():
         d["name"] = rates.get(int(cid), {}).get("name", "")
-    text = (f"📊 NewAPI 消费日报\n━━━━━━━━━━━━━━━━━\n"
-            f"⏰ 日期: {date_str}\n🔑 令牌: {TOKEN_NAME}\n📐 方式: 小时报叠加\n━━━━━━━━━━━━━━━━━")
-    text += _channel_report_lines(channels)
-    text += "\n\n━━━━━━━━━━━━━━━━━\n"
-    text += f"💎 实付合计  ${total_real:,.2f}\n"
-    text += f"📊 消费合计  ${total_usd:,.2f}\n"
-    text += f"📞 总调用    {total_calls:,} 次\n"
-    if missing:
-        text += f"⚠️ 缺失时段: {', '.join(missing)}\n"
-    text += "━━━━━━━━━━━━━━━━━"
+    text = build_daily_report_text(
+        date_str,
+        TOKEN_NAME,
+        channels,
+        total_real,
+        total_usd,
+        total_calls,
+        missing,
+    )
     data = {"channels": {str(k): v for k, v in channels.items()},
             "total_real": total_real, "total_usd": total_usd,
             "total_calls": total_calls, "missing": missing}
     return text, data
+
+@app.get("/api/report/hourly/{date_str}/{hour}", dependencies=[Depends(require_auth)])
+def api_report_hourly(date_str: str, hour: int):
+    if hour < 0 or hour > 23:
+        raise HTTPException(400, "hour must be 0-23")
+    try:
+        start = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=SHANGHAI, hour=hour)
+    except ValueError:
+        raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+    text, data = build_hourly_report(start)
+    if text is None:
+        raise HTTPException(404, "快照不存在")
+    return {"text": text, "data": data}
+
+@app.get("/api/report/daily/{date_str}", dependencies=[Depends(require_auth)])
+def api_report_daily(date_str: str):
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "日期格式应为 YYYY-MM-DD")
+    text, data = build_daily_report(date_str)
+    return {"text": text, "data": data}
 
 def push_webhook(report_type, text, data):
     """POST a generic JSON payload to the configured webhook. Returns True on 2xx."""
@@ -1723,6 +1729,9 @@ def _run_scheduler():
         now = now_shanghai()
         next_hour = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         time.sleep(max(1, (next_hour - now).total_seconds() + 30))
+        lease = sqlite_lease(DB_PATH, "scheduler-hourly", owner=INSTANCE_OWNER, ttl_secs=3500)
+        if not lease.acquired:
+            continue
         try:
             res = api_snapshot_hourly()
             if not res.get("ok", True):
@@ -1761,6 +1770,9 @@ def _run_error_monitor():
         now = now_shanghai()
         next_min = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
         time.sleep(max(1, (next_min - now).total_seconds() + 5))
+        lease = sqlite_lease(DB_PATH, "error-monitor", owner=INSTANCE_OWNER, ttl_secs=75)
+        if not lease.acquired:
+            continue
         try:
             check_error_rates()
         except Exception as e:
@@ -1772,10 +1784,12 @@ def _run_balance_poller():
     """Refresh configured channels' balances shortly after startup, then every 10 minutes."""
     time.sleep(30)  # let startup settle before the first (network) refresh
     while True:
+        lease = sqlite_lease(DB_PATH, "balance-poller", owner=INSTANCE_OWNER, ttl_secs=BALANCE_REFRESH_SECS + 120)
         try:
-            results = refresh_all_balances()
-            if results:
-                print(f"[balance] refreshed {len(results)} channel(s)", flush=True)
+            if lease.acquired:
+                results = refresh_all_balances()
+                if results:
+                    print(f"[balance] refreshed {len(results)} channel(s)", flush=True)
         except Exception as e:
             print(f"[balance] poller error: {e}", flush=True)
         time.sleep(BALANCE_REFRESH_SECS)
@@ -1786,14 +1800,16 @@ def _on_startup():
         _pg_pool.open()
     except Exception as e:
         print(f"[Startup] pg pool open error: {e}", flush=True)
-    try:
-        backfill_today_snapshots()
-    except Exception as e:
-        print(f"[Startup] backfill error: {e}", flush=True)
-    try:
-        cleanup_old_snapshots(7)
-    except Exception as e:
-        print(f"[Startup] cleanup error: {e}", flush=True)
+    startup_lease = sqlite_lease(DB_PATH, "startup-maintenance", owner=INSTANCE_OWNER, ttl_secs=300)
+    if startup_lease.acquired:
+        try:
+            backfill_today_snapshots()
+        except Exception as e:
+            print(f"[Startup] backfill error: {e}", flush=True)
+        try:
+            cleanup_old_snapshots(7)
+        except Exception as e:
+            print(f"[Startup] cleanup error: {e}", flush=True)
     import threading
     threading.Thread(target=_run_scheduler, daemon=True).start()
     threading.Thread(target=_run_error_monitor, daemon=True).start()
