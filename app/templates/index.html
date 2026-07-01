@@ -129,7 +129,7 @@ tr:hover{background:rgba(127,127,127,.04)}
 .cs-bar.green{background:var(--accent2)}
 .cs-bar.yellow{background:var(--accent3)}
 .cs-bar.red{background:var(--accent4)}
-#csTip{position:fixed;left:0;top:0;z-index:9999;pointer-events:none;opacity:0;background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow);border-radius:9px;padding:8px 11px;font-size:12px;line-height:1.4;white-space:nowrap;transition:opacity .13s ease,transform .16s cubic-bezier(.2,.8,.2,1)}
+#csTip{position:fixed;left:0;top:0;z-index:9999;pointer-events:none;opacity:0;background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow);border-radius:9px;padding:8px 11px;font-size:12px;line-height:1.4;white-space:pre-line;transition:opacity .13s ease,transform .16s cubic-bezier(.2,.8,.2,1)}
 .cs-foot{display:flex;justify-content:space-between;font-size:9px;color:var(--text2);letter-spacing:1.5px;margin-top:5px}
 .cs-legend{display:flex;gap:12px;align-items:center;font-size:11px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--text2)}
 .cs-legend span{display:flex;align-items:center;gap:4px}
@@ -967,14 +967,15 @@ function renderChannelStatus(data) {
       let cls, tip;
       if (c.rate === null || c.total === 0) {
         cls = '';
-        tip = `<div style="color:var(--text2);font-size:11px">${c.t}</div><div style="margin-top:3px;color:var(--text2)">无请求</div>`;
+        tip = `${c.t}\n无请求`;
       } else {
         const r = c.rate * 100;
+        const errors = c.total - c.success;
+        const errRate = 100 - r;
         cls = r >= 95 ? 'green' : (r >= 90 ? 'yellow' : 'red');
-        const col = r >= 95 ? 'var(--accent2)' : (r >= 90 ? 'var(--accent3)' : 'var(--accent4)');
-        tip = `<div style="color:var(--text2);font-size:11px">${c.t}</div><div style="margin-top:3px"><b style="color:${col};font-size:13px">${r.toFixed(1)}%</b> <span style="color:var(--text2)">${c.success}/${c.total}</span></div>`;
+        tip = `${c.t}\n成功 ${c.success.toLocaleString()} 次\n失败 ${errors.toLocaleString()} 次\n错误率 ${errRate.toFixed(1)}%`;
       }
-      return `<div class="cs-bar ${cls}" data-tip='${tip}'></div>`;
+      return `<div class="cs-bar ${cls}" data-tip='${escapeAttr(tip)}'></div>`;
     }).join('');
 
     const errors = t - s;
