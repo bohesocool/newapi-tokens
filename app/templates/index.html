@@ -222,6 +222,16 @@ tr:hover{background:rgba(127,127,127,.04)}
         <div class="stat-value" id="curRpm">--</div>
         <div class="stat-label">近 60 秒请求数 · 全渠道</div>
       </div>
+      <div class="card stat-card green">
+        <div class="stat-label">Mini 模型 RPM</div>
+        <div class="stat-value" id="curRpmMini">--</div>
+        <div class="stat-label">近 60 秒 · model 含 -mini</div>
+      </div>
+      <div class="card stat-card amber">
+        <div class="stat-label">非 Mini 模型 RPM</div>
+        <div class="stat-value" id="curRpmOther">--</div>
+        <div class="stat-label">近 60 秒 · 其余模型</div>
+      </div>
     </div>
 
     <!-- Server Load -->
@@ -297,7 +307,10 @@ tr:hover{background:rgba(127,127,127,.04)}
   <!-- Channels Tab -->
   <div id="tab-channels" style="display:none">
     <div class="card">
-      <div class="card-title">渠道系数管理</div>
+      <div class="card-title">
+        <span>渠道系数管理</span>
+        <button class="btn btn-sm btn-ghost" id="syncChBtn" onclick="syncChannels()">从 new-api 同步</button>
+      </div>
       <table id="channelsTable">
         <thead>
           <tr><th>ID</th><th>名称</th><th>系数</th><th>余额查询</th><th>更新时间</th><th>操作</th></tr>
@@ -917,6 +930,10 @@ function renderChannelStatus(data) {
   lastStatusData = data;
   const rpmEl = document.getElementById('curRpm');
   if (rpmEl) rpmEl.textContent = data.error ? '—' : (data.total_rpm || 0).toLocaleString();
+  const rpmMiniEl = document.getElementById('curRpmMini');
+  if (rpmMiniEl) rpmMiniEl.textContent = data.error ? '—' : (data.mini_rpm || 0).toLocaleString();
+  const rpmOtherEl = document.getElementById('curRpmOther');
+  if (rpmOtherEl) rpmOtherEl.textContent = data.error ? '—' : (data.other_rpm || 0).toLocaleString();
   const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
   if (data.error) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">数据库查询失败，暂无渠道状态</div>';
@@ -1237,6 +1254,22 @@ async function addChannel() {
   document.getElementById('newChId').value = '';
   document.getElementById('newChName').value = '';
   document.getElementById('newChRate').value = '';
+  loadChannels();
+}
+
+// 从 new-api 拉取全量渠道：新增的入库，已存在的仅刷新名称（不动系数/余额配置）
+async function syncChannels() {
+  const btn = document.getElementById('syncChBtn');
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = '同步中…';
+  try {
+    const r = await (await apiFetch('/api/channels/sync', {method:'POST'})).json();
+    toast(`同步完成：新增 ${r.added || 0}，改名 ${r.renamed || 0}，共 ${r.total || 0} 个`);
+  } catch (e) {
+    toast('同步失败：' + (e.message || e));
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
   loadChannels();
 }
 

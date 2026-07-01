@@ -392,6 +392,26 @@ GROUP BY channel_id"""
         return None
     return {int(r[0]): int(r[1]) for r in rows}
 
+def query_pg_rpm_by_model(start_ts, end_ts):
+    """Trailing-window request count split by whether model_name marks a 'mini'
+    model (ILIKE '%-mini%'). Returns (mini_count, other_count) or (None, None)
+    on failure. Uses idx_created_at_type — the model_name filter is applied
+    after the same indexed range scan as the other log queries."""
+    sql = """
+SELECT
+  count(*) FILTER (WHERE model_name ILIKE '%-mini%'),
+  count(*) FILTER (WHERE model_name NOT ILIKE '%-mini%')
+FROM logs
+WHERE type IN (2, 5)
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s"""
+    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    if rows is None:
+        return None, None
+    r = rows[0]
+    return int(r[0]), int(r[1])
+
 def now_shanghai():
     return datetime.now(SHANGHAI)
 
@@ -841,6 +861,41 @@ def api_set_channel_status(ch_id: int, body: ChannelStatusBody):
         raise HTTPException(502, _api_err(resp, st, "调用 new-api 失败"))
     return {"ok": True, "enabled": body.status == 1}
 
+@app.post("/api/channels/sync", dependencies=[Depends(require_session)])
+def api_sync_channels():
+    """Pull all channels from new-api and upsert into the local channels table.
+    New channels are inserted with rate=0 (configure manually). For existing
+    channels only the name is refreshed — rate / balance config are never touched.
+    Returns counts so the UI can report what changed."""
+    if not _control_settings()[0]:
+        raise HTTPException(400, "未配置 new-api 控制凭据，无法同步")
+    full = fetch_newapi_channels()
+    if full is None:
+        raise HTTPException(502, "拉取 new-api 渠道失败")
+    added, renamed = 0, 0
+    now = now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as conn:
+        existing = {r["id"]: r["name"] for r in
+                    conn.execute("SELECT id, name FROM channels").fetchall()}
+        for cid_str, info in full.items():
+            try:
+                cid = int(cid_str)
+            except ValueError:
+                continue
+            name = info.get("name") or ""
+            if cid in existing:
+                if existing[cid] != name:
+                    conn.execute("UPDATE channels SET name = ?, updated_at = ? WHERE id = ?",
+                                 (name, now, cid))
+                    renamed += 1
+            else:
+                conn.execute("INSERT INTO channels (id, name, rate) VALUES (?, ?, 0)",
+                             (cid, name))
+                added += 1
+        conn.commit()
+    return {"ok": True, "added": added, "renamed": renamed,
+            "total": len(full)}
+
 @app.get("/api/hourly", dependencies=[Depends(require_auth)])
 def api_hourly():
     """Get current hour data (live query). Cached briefly so concurrent polls share one query."""
@@ -971,6 +1026,10 @@ def _compute_channel_status(minutes):
     rpm_end = int(now.timestamp())
     rpm_map = query_pg_rpm(rpm_end - 60, rpm_end) or {}
     total_rpm = sum(rpm_map.values())
+    # Trailing-60s RPM split by model: mini vs non-mini (total RPM stays the sum above).
+    mini_rpm, other_rpm = query_pg_rpm_by_model(rpm_end - 60, rpm_end)
+    if mini_rpm is None:
+        mini_rpm, other_rpm = 0, 0
     bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
     bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
     bucket_lbl = [b.strftime("%m-%d %H:%M") for b in bucket_dts]
@@ -991,7 +1050,8 @@ def _compute_channel_status(minutes):
                                 "rate": rates.get(ch_id, {}).get("rate", 0),
                                 "rpm": rpm_map.get(ch_id, 0), "cells": cells}
     return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
-            "channels": channels, "total_rpm": total_rpm, "error": False}
+            "channels": channels, "total_rpm": total_rpm,
+            "mini_rpm": mini_rpm, "other_rpm": other_rpm, "error": False}
 
 @app.post("/api/snapshot/hourly", dependencies=[Depends(require_auth)])
 def api_snapshot_hourly():
@@ -1231,10 +1291,10 @@ def _newapi_call(method, path, *, body=None):
 # new-api ChannelStatus: 1=enabled, 2=manual disabled, 3=auto disabled
 NA_STATUS_ENABLED = 1
 
-def fetch_newapi_channel_status():
-    """Return {channel_id: enabled_bool} for all channels, or None on failure.
-    new-api GET /api/channel/ is paged (page_size cap 100), so walk pages until
-    we've collected `total` items."""
+def fetch_newapi_channels():
+    """Return {channel_id: {"name": str, "enabled": bool}} for all new-api channels,
+    or None on failure. GET /api/channel/ is paged (page_size cap 100), so walk
+    pages until we've collected `total` items. Each item carries id/name/status."""
     out = {}
     page = 1
     while True:
@@ -1247,12 +1307,22 @@ def fetch_newapi_channel_status():
             cid = ch.get("id")
             if cid is None:
                 continue
-            out[str(cid)] = (ch.get("status") == NA_STATUS_ENABLED)
+            out[str(cid)] = {
+                "name": ch.get("name") or "",
+                "enabled": (ch.get("status") == NA_STATUS_ENABLED),
+            }
         total = data.get("total") or 0
         if len(out) >= total or not items:
             break
         page += 1
     return out
+
+def fetch_newapi_channel_status():
+    """Return {channel_id: enabled_bool} for all channels, or None on failure."""
+    full = fetch_newapi_channels()
+    if full is None:
+        return None
+    return {cid: info["enabled"] for cid, info in full.items()}
 
 @app.get("/api/settings/control", dependencies=[Depends(require_session)])
 def api_get_control():
