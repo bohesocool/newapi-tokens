@@ -385,6 +385,38 @@ ORDER BY channel_id, m"""
         }
     return out
 
+def query_pg_minute_model_status(start_ts, end_ts):
+    """Per-minute success/error counts split into mini/non-mini model groups."""
+    sql = """
+SELECT
+  created_at / 60 AS m,
+  CASE
+    WHEN model_name ILIKE %s THEN 'mini'
+    WHEN model_name NOT ILIKE %s THEN 'other'
+    ELSE NULL
+  END AS model_group,
+  count(*) FILTER (WHERE type = 2),
+  count(*) FILTER (WHERE type = 5)
+FROM logs
+WHERE type IN (2, 5)
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s
+GROUP BY m, model_group
+ORDER BY m, model_group"""
+    rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
+    if rows is None:
+        return None
+    out = {"mini": {}, "other": {}}
+    for r in rows:
+        group = r[1]
+        if group not in out:
+            continue
+        out[group][int(r[0])] = {
+            "success": int(r[2]), "errors": int(r[3]),
+        }
+    return out
+
 def query_pg_rpm_detail(start_ts, end_ts):
     """Trailing-window request counts per channel plus mini/non-mini totals.
     Keeps the RPM cards to one indexed Postgres range scan instead of two."""
@@ -1135,8 +1167,9 @@ def _compute_channel_status(minutes):
     start_ts = int(first_min.timestamp())
     end_ts = int((cur_min + timedelta(minutes=1)).timestamp())  # exclusive; includes current minute
     data = query_pg_minute_status(start_ts, end_ts)
+    model_data = query_pg_minute_model_status(start_ts, end_ts)
     rates = get_rates()
-    if data is None:
+    if data is None or model_data is None:
         return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
                 "channels": {}, "error": True}
     # Trailing-60s request count per channel = current RPM (independent of the minute buckets).
@@ -1153,6 +1186,18 @@ def _compute_channel_status(minutes):
     bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
     bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
     bucket_lbl = [b.strftime("%m-%d %H:%M") for b in bucket_dts]
+    def build_overall_cells(group):
+        cells = []
+        gd = model_data.get(group, {})
+        for bi, lbl in zip(bucket_idx, bucket_lbl):
+            c = gd.get(bi)
+            if c:
+                total = c["success"] + c["errors"]
+                cells.append({"t": lbl, "success": c["success"], "errors": c["errors"],
+                              "total": total, "rate": (c["success"] / total) if total else None})
+            else:
+                cells.append({"t": lbl, "success": 0, "errors": 0, "total": 0, "rate": None})
+        return cells
     all_ids = sorted(set(rates.keys()) | set(data.keys()))
     channels = {}
     for ch_id in all_ids:
@@ -1173,7 +1218,12 @@ def _compute_channel_status(minutes):
                                 "avg_frt": (latency.get(ch_id) or {}).get("frt")}
     return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
             "channels": channels, "total_rpm": total_rpm,
-            "mini_rpm": mini_rpm, "other_rpm": other_rpm, "error": False}
+            "mini_rpm": mini_rpm, "other_rpm": other_rpm,
+            "overall": {
+                "mini": {"name": "Mini 模型", "cells": build_overall_cells("mini")},
+                "other": {"name": "非 Mini 模型", "cells": build_overall_cells("other")},
+            },
+            "error": False}
 
 @app.post("/api/snapshot/hourly", dependencies=[Depends(require_auth)])
 def api_snapshot_hourly():

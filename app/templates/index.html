@@ -107,6 +107,17 @@ tr:hover{background:rgba(127,127,127,.04)}
 /* Channel status monitor (uptime-style cards) */
 .cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
 .cs-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
+.overall-status{margin-bottom:16px;padding:16px 18px}
+.os-row{display:grid;grid-template-columns:140px 110px minmax(0,1fr);gap:14px;align-items:center}
+.os-row + .os-row{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+.os-name{font-size:14px;font-weight:700}
+.os-rate{font-size:28px;font-weight:800;letter-spacing:-1px;text-align:right}
+.os-rate small{font-size:13px;font-weight:700;margin-left:2px}
+.os-bars{min-width:0}
+@media(max-width:640px){
+  .os-row{grid-template-columns:1fr;gap:8px}
+  .os-rate{text-align:left}
+}
 /* 拖拽：仅顶部标题区(.cs-top)为拖拽手柄，整卡随拖移动 */
 .cs-top{cursor:grab}
 .cs-top:active{cursor:grabbing}
@@ -200,6 +211,9 @@ tr:hover{background:rgba(127,127,127,.04)}
   <!-- Dashboard Tab -->
   <div id="tab-dashboard">
     <div id="errBanner" style="display:none;background:var(--accent4);color:#fff;padding:10px 14px;border-radius:8px;margin-bottom:16px;font-size:14px"></div>
+    <div class="card overall-status" id="overallStatus">
+      <div style="color:var(--text2);font-size:13px">总状态载入中...</div>
+    </div>
     <!-- Summary Cards -->
     <div class="grid grid-cards" style="margin-bottom:16px">
       <div class="card stat-card green">
@@ -986,6 +1000,51 @@ function bindCsDnD(wrap) {
   });
   wrap.addEventListener('dragend', () => _csClearDrag(wrap));
 }
+function buildStatusBars(cells) {
+  let success = 0, total = 0;
+  const barsHtml = (cells || []).map(c => {
+    success += c.success || 0; total += c.total || 0;
+    let cls, tip;
+    if (c.rate === null || !c.total) {
+      cls = '';
+      tip = `${c.t}\n无请求`;
+    } else {
+      const r = c.rate * 100;
+      const errors = c.total - c.success;
+      const errRate = 100 - r;
+      cls = r >= 95 ? 'green' : (r >= 90 ? 'yellow' : 'red');
+      tip = `${c.t}\n成功 ${c.success.toLocaleString()} 次\n失败 ${errors.toLocaleString()} 次\n错误率 ${errRate.toFixed(1)}%`;
+    }
+    return `<div class="cs-bar ${cls}" data-tip='${escapeAttr(tip)}'></div>`;
+  }).join('');
+  return { success, total, barsHtml, pct: total > 0 ? (success / total * 100) : null };
+}
+function renderOverallStatus(data, refreshLbl) {
+  const el = document.getElementById('overallStatus');
+  if (!el) return;
+  if (data.error) {
+    el.innerHTML = '<div style="color:var(--text2);font-size:13px">数据库查询失败，暂无总状态</div>';
+    return;
+  }
+  const groups = [
+    data.overall && data.overall.mini ? data.overall.mini : {name: 'Mini 模型', cells: []},
+    data.overall && data.overall.other ? data.overall.other : {name: '非 Mini 模型', cells: []},
+  ];
+  el.innerHTML = groups.map(g => {
+    const stat = buildStatusBars(g.cells);
+    const color = stat.pct === null ? 'var(--text2)' : (stat.pct >= 95 ? 'var(--accent2)' : (stat.pct >= 90 ? 'var(--accent3)' : 'var(--accent4)'));
+    return `
+      <div class="os-row">
+        <div class="os-name">${escapeHtml(g.name)}</div>
+        <div class="os-rate" style="color:${color}">${stat.pct === null ? '—' : stat.pct.toFixed(2)}<small>${stat.pct === null ? '' : '%'}</small></div>
+        <div class="os-bars">
+          <div class="cs-striprow"><span>近 60 分钟</span><span>${refreshLbl}</span></div>
+          <div class="cs-bars">${stat.barsHtml}</div>
+        </div>
+      </div>`;
+  }).join('');
+  bindCsTooltip(el);
+}
 function renderChannelStatus(data) {
   const wrap = document.getElementById('channelStatus');
   if (!wrap) return;
@@ -996,6 +1055,9 @@ function renderChannelStatus(data) {
   if (rpmMiniEl) rpmMiniEl.textContent = data.error ? '—' : (data.mini_rpm || 0).toLocaleString();
   const rpmOtherEl = document.getElementById('curRpmOther');
   if (rpmOtherEl) rpmOtherEl.textContent = data.error ? '—' : (data.other_rpm || 0).toLocaleString();
+  const ms = currentRefreshMs();
+  const refreshLbl = ms > 0 ? `${Math.round(ms / 1000)}S 后刷新` : '自动刷新关闭';
+  renderOverallStatus(data, refreshLbl);
   const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#14b8a6','#f97316'];
   if (data.error) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">数据库查询失败，暂无渠道状态</div>';
@@ -1011,8 +1073,6 @@ function renderChannelStatus(data) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">暂无渠道</div>';
     return;
   }
-  const ms = currentRefreshMs();
-  const refreshLbl = ms > 0 ? `${Math.round(ms / 1000)}S 后刷新` : '自动刷新关闭';
   // status by window availability: green ≥95 正常 / amber ≥90 降级 / red 异常 / null 无数据
   const STATUS = {
     green:  { txt: '正常',  glyph: '✓', c: 'var(--accent2)', bg: 'rgba(16,185,129,.13)' },
