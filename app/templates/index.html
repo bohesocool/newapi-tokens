@@ -142,13 +142,20 @@ tr:hover{background:rgba(127,127,127,.04)}
 .cs-avail .av{font-size:30px;font-weight:800;letter-spacing:-1px;line-height:1}
 .cs-avail .av small{font-size:14px;font-weight:700;margin-left:2px}
 .cs-striprow{display:flex;justify-content:space-between;font-size:10px;color:var(--text2);margin-bottom:5px}
-.cs-bars{display:flex;gap:2px;align-items:stretch;height:34px;padding:3px;background:linear-gradient(180deg,rgba(127,127,127,.10),rgba(127,127,127,.04));border:1px solid var(--border);border-radius:9px;box-shadow:inset 0 1px 0 rgba(255,255,255,.04),inset 0 -8px 18px rgba(0,0,0,.10)}
-.cs-bar{flex:1;min-width:2px;border-radius:4px;background:linear-gradient(180deg,rgba(148,163,184,.22),rgba(100,116,139,.12));cursor:pointer;transition:opacity .16s ease,transform .16s cubic-bezier(.2,.8,.2,1),filter .16s ease;transform-origin:center bottom}
-.cs-bars:hover .cs-bar{opacity:.45}
-.cs-bars .cs-bar:hover{opacity:1;filter:saturate(1.15) brightness(1.06);transform:translateY(-2px) scaleY(1.12)}
-.cs-bar.green{background:linear-gradient(180deg,#34d399 0%,#10b981 100%);box-shadow:0 0 10px rgba(16,185,129,.18)}
-.cs-bar.yellow{background:linear-gradient(180deg,#fbbf24 0%,#f59e0b 100%);box-shadow:0 0 10px rgba(245,158,11,.18)}
-.cs-bar.red{background:linear-gradient(180deg,#fb7185 0%,#ef4444 100%);box-shadow:0 0 10px rgba(239,68,68,.18)}
+.cs-bars{display:flex;gap:2px;align-items:stretch;height:30px}
+.cs-bar{flex:1;min-width:2px;border-radius:1.5px;background:rgba(127,127,127,.12);cursor:pointer;transition:opacity .18s ease,transform .18s cubic-bezier(.2,.8,.2,1);transform-origin:center bottom}
+.cs-bars:hover .cs-bar{opacity:.32}
+.cs-bars .cs-bar:hover{opacity:1;transform:scaleX(1.9) scaleY(1.08)}
+.cs-bar.green{background:var(--accent2)}
+.cs-bar.yellow{background:var(--accent3)}
+.cs-bar.red{background:var(--accent4)}
+.overall-status .cs-bars{height:22px;gap:3px;padding:0;background:transparent}
+.overall-status .cs-bar{border-radius:999px;background:rgba(127,127,127,.16);transition:opacity .14s ease,transform .14s ease}
+.overall-status .cs-bars:hover .cs-bar{opacity:.55}
+.overall-status .cs-bars .cs-bar:hover{opacity:1;transform:translateY(-1px) scaleY(1.08)}
+.overall-status .cs-bar.green{background:var(--accent2)}
+.overall-status .cs-bar.yellow{background:var(--accent3)}
+.overall-status .cs-bar.red{background:var(--accent4)}
 #csTip{position:fixed;left:0;top:0;z-index:9999;pointer-events:none;opacity:0;background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow);border-radius:9px;padding:8px 11px;font-size:12px;line-height:1.4;white-space:pre-line;transition:opacity .13s ease,transform .16s cubic-bezier(.2,.8,.2,1)}
 .cs-foot{display:flex;justify-content:space-between;font-size:9px;color:var(--text2);letter-spacing:1.5px;margin-top:5px}
 .cs-legend{display:flex;gap:12px;align-items:center;font-size:11px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--text2)}
