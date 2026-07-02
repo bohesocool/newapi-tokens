@@ -107,6 +107,11 @@ tr:hover{background:rgba(127,127,127,.04)}
 /* Channel status monitor (uptime-style cards) */
 .cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
 .cs-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
+/* 拖拽：仅顶部标题区(.cs-top)为拖拽手柄，整卡随拖移动 */
+.cs-top{cursor:grab}
+.cs-top:active{cursor:grabbing}
+.cs-card.dragging{opacity:.4}
+.cs-card.drag-over{outline:2px dashed var(--accent);outline-offset:2px}
 .cs-top{display:flex;align-items:center;gap:10px}
 .cs-ic{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;flex-shrink:0}
 .cs-title{flex:1;font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -275,6 +280,7 @@ tr:hover{background:rgba(127,127,127,.04)}
       <div class="card-title" style="margin-bottom:14px;padding:0 2px">
         <span>渠道状态监控 (近 60 分钟 · 每格 1 分钟)</span>
         <div class="cs-legend">
+          <button class="btn btn-sm btn-ghost" onclick="resetCsOrder()" title="恢复默认排序（按渠道 ID 升序）" style="text-transform:none;letter-spacing:0">重置布局</button>
           <span><i style="background:var(--accent2)"></i>≥95%</span>
           <span><i style="background:var(--accent3)"></i>90–95%</span>
           <span><i style="background:var(--accent4)"></i>&lt;90%</span>
@@ -924,6 +930,57 @@ async function toggleChannelStatus(id, enable, btn) {
   if (lastStatusData) renderChannelStatus(lastStatusData);
 }
 let lastStatusData = null;  // 缓存最近一份渠道状态，供启停后局部刷新重渲染
+// ── 渠道卡片拖拽排序：仅顶部标题区(.cs-top)可拖，顺序持久化到 localStorage ──
+let _csDragId = null;
+function getCsOrder() { try { return JSON.parse(localStorage.getItem('csOrder') || '[]'); } catch(e) { return []; } }
+function saveCsOrder(arr) { localStorage.setItem('csOrder', JSON.stringify(arr)); }
+function resetCsOrder() { localStorage.removeItem('csOrder'); if (lastStatusData) renderChannelStatus(lastStatusData); }
+// 找指针"之后"的第一张卡片（文档顺序），作为插入锚点：dragging 将插到它前面；null 表示插末尾。
+// 二维 grid 判据：指针在卡片上方整行 (y<top)，或与卡片同行 (y<bottom) 且在其左半 (x<中线)。
+function _csAfterEl(wrap, x, y) {
+  for (const c of wrap.querySelectorAll('.cs-card:not(.dragging)')) {
+    const b = c.getBoundingClientRect();
+    if (y < b.top || (y < b.bottom && x < b.left + b.width / 2)) return c;
+  }
+  return null;
+}
+function _csClearDrag(wrap) {
+  wrap.querySelectorAll('.cs-card').forEach(c => c.classList.remove('dragging', 'drag-over'));
+  _csDragId = null;
+}
+// 事件委托到稳定的 #channelStatus 容器（grid 每次刷新都会重建，不能绑在 grid 上）
+function bindCsDnD(wrap) {
+  if (wrap._dndBound) return;
+  wrap._dndBound = true;
+  wrap.addEventListener('dragstart', e => {
+    const card = e.target.closest('.cs-card');
+    if (!card) return;
+    if (!e.target.closest('.cs-top')) { e.preventDefault(); return; }  // 仅标题区可拖，按钮区域拖不动
+    _csDragId = card.dataset.id;
+    card.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', _csDragId); } catch(_) {}
+  });
+  wrap.addEventListener('dragover', e => {
+    if (!_csDragId) return;
+    e.preventDefault();
+    const dragging = wrap.querySelector('.cs-card.dragging');
+    if (!dragging) return;
+    const after = _csAfterEl(wrap, e.clientX, e.clientY);
+    wrap.querySelectorAll('.cs-card.drag-over').forEach(c => c.classList.remove('drag-over'));
+    const grid = wrap.querySelector('.cs-cards');
+    if (after) { after.classList.add('drag-over'); after.parentNode.insertBefore(dragging, after); }
+    else if (grid) { grid.appendChild(dragging); }
+  });
+  wrap.addEventListener('drop', e => {
+    if (!_csDragId) return;
+    e.preventDefault();
+    const grid = wrap.querySelector('.cs-cards');
+    if (grid) saveCsOrder([...grid.children].map(c => c.dataset.id).filter(Boolean));
+    _csClearDrag(wrap);
+  });
+  wrap.addEventListener('dragend', () => _csClearDrag(wrap));
+}
 function renderChannelStatus(data) {
   const wrap = document.getElementById('channelStatus');
   if (!wrap) return;
@@ -939,7 +996,12 @@ function renderChannelStatus(data) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">数据库查询失败，暂无渠道状态</div>';
     return;
   }
-  const ids = Object.keys(data.channels).sort((a, b) => a - b);
+  // 排序：先按 localStorage 保存的自定义顺序，未保存的新渠道按 ID 升序追加到末尾
+  const allIds = Object.keys(data.channels);
+  const saved = getCsOrder();
+  const ids = [];
+  saved.forEach(id => { if (allIds.indexOf(id) !== -1) ids.push(id); });
+  allIds.filter(id => saved.indexOf(id) === -1).sort((a, b) => a - b).forEach(id => ids.push(id));
   if (!ids.length) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">暂无渠道</div>';
     return;
@@ -1021,6 +1083,8 @@ function renderChannelStatus(data) {
     }
     const card = document.createElement('div');
     card.className = 'cs-card';
+    card.draggable = true;
+    card.dataset.id = id;
     card.innerHTML = `
       <div class="cs-top">
         <span class="cs-ic" style="background:${st.bg};color:${st.c}">${st.glyph}</span>
@@ -1068,6 +1132,7 @@ function renderChannelStatus(data) {
   wrap.innerHTML = '';
   wrap.appendChild(grid);
   bindCsTooltip(wrap);
+  bindCsDnD(wrap);
 }
 
 // Custom hover tooltip for the status bars — replaces the laggy native title:
