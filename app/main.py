@@ -475,6 +475,37 @@ ORDER BY channel_id"""
         }
     return out
 
+def query_pg_model_avg_latency(start_ts, end_ts):
+    """Average request duration and first-response time split by mini/non-mini."""
+    sql = """
+SELECT
+  CASE
+    WHEN model_name ILIKE %s THEN 'mini'
+    WHEN model_name NOT ILIKE %s THEN 'other'
+    ELSE NULL
+  END AS model_group,
+  AVG(use_time),
+  AVG(NULLIF(substring(other::text FROM '"frt"[[:space:]]*:[[:space:]]*([-0-9.]+)'), '')::float8)
+FROM logs
+WHERE type = 2
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s
+GROUP BY model_group"""
+    rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
+    if rows is None:
+        return None
+    out = {}
+    for r in rows:
+        group = r[0]
+        if group not in ("mini", "other"):
+            continue
+        out[group] = {
+            "dur": float(r[1]) if r[1] is not None else None,
+            "frt": float(r[2]) if r[2] is not None else None,
+        }
+    return out
+
 def now_shanghai():
     return datetime.now(SHANGHAI)
 
@@ -1182,6 +1213,7 @@ def _compute_channel_status(minutes):
     # Per-channel avg total duration (s) and avg first-response/首字 time (ms)
     # over the same window as the minute strip above.
     latency = query_pg_avg_latency(start_ts, end_ts) or {}
+    model_latency = query_pg_model_avg_latency(start_ts, end_ts) or {}
     total_rpm = sum(rpm_map.values())
     bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
     bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
@@ -1220,8 +1252,12 @@ def _compute_channel_status(minutes):
             "channels": channels, "total_rpm": total_rpm,
             "mini_rpm": mini_rpm, "other_rpm": other_rpm,
             "overall": {
-                "mini": {"name": "Mini 模型", "cells": build_overall_cells("mini")},
-                "other": {"name": "非 Mini 模型", "cells": build_overall_cells("other")},
+                "mini": {"name": "Mini 模型", "cells": build_overall_cells("mini"),
+                         "avg_dur": (model_latency.get("mini") or {}).get("dur"),
+                         "avg_frt": (model_latency.get("mini") or {}).get("frt")},
+                "other": {"name": "非 Mini 模型", "cells": build_overall_cells("other"),
+                          "avg_dur": (model_latency.get("other") or {}).get("dur"),
+                          "avg_frt": (model_latency.get("other") or {}).get("frt")},
             },
             "error": False}
 

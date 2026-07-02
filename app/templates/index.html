@@ -108,15 +108,19 @@ tr:hover{background:rgba(127,127,127,.04)}
 .cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
 .cs-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
 .overall-status{margin-bottom:16px;padding:16px 18px}
-.os-row{display:grid;grid-template-columns:140px 110px minmax(0,1fr);gap:14px;align-items:center}
+.os-row{display:grid;grid-template-columns:140px 110px 180px minmax(0,1fr);gap:14px;align-items:center}
 .os-row + .os-row{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
 .os-name{font-size:14px;font-weight:700}
 .os-rate{font-size:28px;font-weight:800;letter-spacing:-1px;text-align:right}
 .os-rate small{font-size:13px;font-weight:700;margin-left:2px}
+.os-metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.os-metric .ml{font-size:11px;color:var(--text2);white-space:nowrap}
+.os-metric .mv{font-size:17px;font-weight:700;margin-top:3px}
 .os-bars{min-width:0}
 @media(max-width:640px){
   .os-row{grid-template-columns:1fr;gap:8px}
   .os-rate{text-align:left}
+  .os-metrics{grid-template-columns:1fr 1fr}
 }
 /* 拖拽：仅顶部标题区(.cs-top)为拖拽手柄，整卡随拖移动 */
 .cs-top{cursor:grab}
@@ -138,13 +142,13 @@ tr:hover{background:rgba(127,127,127,.04)}
 .cs-avail .av{font-size:30px;font-weight:800;letter-spacing:-1px;line-height:1}
 .cs-avail .av small{font-size:14px;font-weight:700;margin-left:2px}
 .cs-striprow{display:flex;justify-content:space-between;font-size:10px;color:var(--text2);margin-bottom:5px}
-.cs-bars{display:flex;gap:2px;align-items:stretch;height:30px}
-.cs-bar{flex:1;min-width:2px;border-radius:1.5px;background:rgba(127,127,127,.12);cursor:pointer;transition:opacity .18s ease,transform .18s cubic-bezier(.2,.8,.2,1);transform-origin:center bottom}
-.cs-bars:hover .cs-bar{opacity:.32}
-.cs-bars .cs-bar:hover{opacity:1;transform:scaleX(1.9) scaleY(1.08)}
-.cs-bar.green{background:var(--accent2)}
-.cs-bar.yellow{background:var(--accent3)}
-.cs-bar.red{background:var(--accent4)}
+.cs-bars{display:flex;gap:2px;align-items:stretch;height:34px;padding:3px;background:linear-gradient(180deg,rgba(127,127,127,.10),rgba(127,127,127,.04));border:1px solid var(--border);border-radius:9px;box-shadow:inset 0 1px 0 rgba(255,255,255,.04),inset 0 -8px 18px rgba(0,0,0,.10)}
+.cs-bar{flex:1;min-width:2px;border-radius:4px;background:linear-gradient(180deg,rgba(148,163,184,.22),rgba(100,116,139,.12));cursor:pointer;transition:opacity .16s ease,transform .16s cubic-bezier(.2,.8,.2,1),filter .16s ease;transform-origin:center bottom}
+.cs-bars:hover .cs-bar{opacity:.45}
+.cs-bars .cs-bar:hover{opacity:1;filter:saturate(1.15) brightness(1.06);transform:translateY(-2px) scaleY(1.12)}
+.cs-bar.green{background:linear-gradient(180deg,#34d399 0%,#10b981 100%);box-shadow:0 0 10px rgba(16,185,129,.18)}
+.cs-bar.yellow{background:linear-gradient(180deg,#fbbf24 0%,#f59e0b 100%);box-shadow:0 0 10px rgba(245,158,11,.18)}
+.cs-bar.red{background:linear-gradient(180deg,#fb7185 0%,#ef4444 100%);box-shadow:0 0 10px rgba(239,68,68,.18)}
 #csTip{position:fixed;left:0;top:0;z-index:9999;pointer-events:none;opacity:0;background:var(--card);border:1px solid var(--border);box-shadow:var(--shadow);border-radius:9px;padding:8px 11px;font-size:12px;line-height:1.4;white-space:pre-line;transition:opacity .13s ease,transform .16s cubic-bezier(.2,.8,.2,1)}
 .cs-foot{display:flex;justify-content:space-between;font-size:9px;color:var(--text2);letter-spacing:1.5px;margin-top:5px}
 .cs-legend{display:flex;gap:12px;align-items:center;font-size:11px;font-weight:400;text-transform:none;letter-spacing:0;color:var(--text2)}
@@ -1019,6 +1023,8 @@ function buildStatusBars(cells) {
   }).join('');
   return { success, total, barsHtml, pct: total > 0 ? (success / total * 100) : null };
 }
+const fmtDur = s => (s == null || isNaN(s)) ? '—' : (s >= 60 ? `${Math.floor(s / 60)}m${Math.round(s % 60)}s` : `${s.toFixed(1)}s`);
+const fmtFrt = ms => (ms == null || isNaN(ms)) ? '—' : (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
 function renderOverallStatus(data, refreshLbl) {
   const el = document.getElementById('overallStatus');
   if (!el) return;
@@ -1037,6 +1043,16 @@ function renderOverallStatus(data, refreshLbl) {
       <div class="os-row">
         <div class="os-name">${escapeHtml(g.name)}</div>
         <div class="os-rate" style="color:${color}">${stat.pct === null ? '—' : stat.pct.toFixed(2)}<small>${stat.pct === null ? '' : '%'}</small></div>
+        <div class="os-metrics">
+          <div class="os-metric">
+            <div class="ml">平均时长</div>
+            <div class="mv" title="近 60 分钟成功请求的平均总耗时">${fmtDur(g.avg_dur)}</div>
+          </div>
+          <div class="os-metric">
+            <div class="ml">平均首字</div>
+            <div class="mv" title="近 60 分钟成功请求的平均首字时延 (TTFT)">${fmtFrt(g.avg_frt)}</div>
+          </div>
+        </div>
         <div class="os-bars">
           <div class="cs-striprow"><span>近 60 分钟</span><span>${refreshLbl}</span></div>
           <div class="cs-bars">${stat.barsHtml}</div>
@@ -1085,9 +1101,6 @@ function renderChannelStatus(data) {
   const errIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>';
   const durIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>';
   const frtIc = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>';
-  // 平均时长(秒) → "3.2s" / "1m5s"；平均首字(毫秒) → "320ms" / "1.2s"
-  const fmtDur = s => (s == null || isNaN(s)) ? '—' : (s >= 60 ? `${Math.floor(s / 60)}m${Math.round(s % 60)}s` : `${s.toFixed(1)}s`);
-  const fmtFrt = ms => (ms == null || isNaN(ms)) ? '—' : (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
 
   const grid = document.createElement('div');
   grid.className = 'cs-cards';
