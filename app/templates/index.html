@@ -568,7 +568,8 @@ let hourlyChart = null;
 let chartType = 'bar';
 let pollTimer = null;
 let sysTimer = null;
-const SYS_REFRESH_MS = 5000;  // CPU/内存独立刷新，5s 足够「接近实时」
+const SYS_REFRESH_MS = 10000;  // CPU/内存独立刷新，10s 足够「接近实时」
+let _dashInFlight = false, _csInFlight = false, _sysInFlight = false;
 let lastHourlyData = null;
 let lastHistory = [];
 let currentApiKey = '';
@@ -622,6 +623,16 @@ function changeRefresh() {
   localStorage.setItem('refreshMs', document.getElementById('refreshSel').value);
   applyRefresh();
 }
+// 标签页隐藏时暂停轮询，避免后台标签页空跑查询；可见时立刻补一次再恢复定时器
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (sysTimer) { clearInterval(sysTimer); sysTimer = null; }
+  } else {
+    loadDashboard(); loadChannelStatus(); loadSystem();
+    applyRefresh();
+  }
+});
 
 async function logout() {
   try { await fetch('/api/logout', { method: 'POST' }); } catch(e) {}
@@ -663,6 +674,8 @@ function usageColor(pct) {
 }
 
 async function loadSystem() {
+  if (_sysInFlight) return;
+  _sysInFlight = true;
   try {
     const resp = await apiFetch('/api/system');
     const d = await resp.json();
@@ -679,6 +692,7 @@ async function loadSystem() {
     memBar.style.width = Math.min(100, d.mem_percent) + '%';
     memBar.style.background = usageColor(d.mem_percent);
   } catch (e) { /* keep last values on transient errors */ }
+  finally { _sysInFlight = false; }
 }
 
 // ── CSV export ──
@@ -710,6 +724,8 @@ function exportHistoryCSV() {
 
 // ── Dashboard ──
 async function loadDashboard() {
+  if (_dashInFlight) return;
+  _dashInFlight = true;
   try {
     const resp = await apiFetch('/api/hourly');
     const data = await resp.json();
@@ -751,7 +767,7 @@ async function loadDashboard() {
       row.className = 'ch-row';
       const errTotal = (ch.calls||0) + (ch.errors||0);
       const errRate = errTotal > 0 ? (ch.errors||0) / errTotal : 0;
-      const errColor = errRate >= 0.10 ? '#ef4444' : 'var(--muted)';
+      const errColor = errRate >= 0.10 ? '#ef4444' : 'var(--text2)';
       const errHtml = `<span style="color:${errColor}"> · 错误率 ${(errRate*100).toFixed(1)}% (${(ch.errors||0).toLocaleString()}失败)</span>`;
       row.innerHTML = `
         <div class="ch-badge" style="background:${colors[i % colors.length]}20;color:${colors[i % colors.length]}">${ch.id}</div>
@@ -768,7 +784,7 @@ async function loadDashboard() {
     });
   } catch(e) {
     console.error('Dashboard error:', e);
-  }
+  } finally { _dashInFlight = false; }
 }
 
 function renderChart(data) {
@@ -778,8 +794,6 @@ function renderChart(data) {
   const labels = data.hourly.map(h => h.hour + ':00');
   const realValues = data.hourly.map(h => h.real_cost || 0);
 
-  if (hourlyChart) hourlyChart.destroy();
-
   const isBar = chartType === 'bar';
   const isLight = document.documentElement.getAttribute('data-theme') === 'light';
   const axisColor = cssVar('--text2') || '#6b7a99';
@@ -787,6 +801,25 @@ function renderChart(data) {
   const tipBg = cssVar('--card');
   const tipBorder = cssVar('--border');
   const tipText = cssVar('--text');
+
+  // 已存在同类型图表 → 仅更新数据与主题色，避免每轮轮询都 destroy + new。
+  // 切换柱/线类型时才重建（Chart.js 不能在实例上改 type）。
+  if (hourlyChart && hourlyChart._rtType === chartType) {
+    hourlyChart.data.labels = labels;
+    hourlyChart.data.datasets[0].data = realValues;
+    hourlyChart.options.scales.x.ticks.color = axisColor;
+    hourlyChart.options.scales.y.ticks.color = axisColor;
+    hourlyChart.options.scales.x.grid.color = gridColor;
+    hourlyChart.options.scales.y.grid.color = gridColor;
+    hourlyChart.options.plugins.legend.labels.color = axisColor;
+    hourlyChart.options.plugins.tooltip.backgroundColor = tipBg;
+    hourlyChart.options.plugins.tooltip.borderColor = tipBorder;
+    hourlyChart.options.plugins.tooltip.titleColor = tipText;
+    hourlyChart.options.plugins.tooltip.bodyColor = tipText;
+    hourlyChart.update();
+    return;
+  }
+  if (hourlyChart) hourlyChart.destroy();
 
   hourlyChart = new Chart(ctx, {
     type: isBar ? 'bar' : 'line',
@@ -848,6 +881,7 @@ function renderChart(data) {
       }
     }
   });
+  hourlyChart._rtType = chartType;
 }
 
 // ── Trend ──
@@ -904,6 +938,8 @@ let lastBalances = {};
 let controlConfigured = false;   // new-api 启停控制是否已配置
 let lastControlStatus = {};      // {channel_id: enabled_bool}
 async function loadChannelStatus() {
+  if (_csInFlight) return;
+  _csInFlight = true;
   try {
     const [statusR, balR, ctrlR] = await Promise.all([
       apiFetch('/api/channel-status?minutes=60'),
@@ -920,6 +956,7 @@ async function loadChannelStatus() {
     }
     renderChannelStatus(await statusR.json());
   } catch(e) { console.error('Channel status error:', e); }
+  finally { _csInFlight = false; }
 }
 async function refreshCardBalance(id, btn) {
   btn.disabled = true; btn.textContent = '…';
@@ -929,7 +966,7 @@ async function refreshCardBalance(id, btn) {
       value: r.value, error: r.error || '', checked_at: r.checked_at };
     toast(r.error ? ('查询失败: ' + r.error) : ('余额 $' + Number(r.value).toFixed(2)));
   } catch(e) { toast('刷新失败'); }
-  loadChannelStatus();
+  if (lastStatusData) renderChannelStatus(lastStatusData);
 }
 async function toggleChannelStatus(id, enable, btn) {
   if (!controlConfigured) { toast('请先在设置页配置 new-api 控制凭据'); return; }
