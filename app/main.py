@@ -412,6 +412,37 @@ GROUP BY channel_id"""
         other_count += int(r[3])
     return rpm_map, mini_count, other_count
 
+def query_pg_avg_latency(start_ts, end_ts):
+    """Per-channel average request duration and first-response (首字) time over
+    [start, end). use_time is the total duration in seconds (integer column).
+    首字时长 is new-api's `frt` (first-response-time, ms) persisted inside the
+    logs.other JSON for successful (type=2) text consume logs. frt is pulled via
+    a regex substring over other::text so it works whether the column is text or
+    jsonb and never errors on malformed/empty JSON. Returns {channel_id:
+    {"dur": sec_or_None, "frt": ms_or_None}} or None."""
+    sql = """
+SELECT
+  channel_id,
+  AVG(use_time),
+  AVG(NULLIF(substring(other::text FROM '"frt"[[:space:]]*:[[:space:]]*([-0-9.]+)'), '')::float8)
+FROM logs
+WHERE type = 2
+  AND token_name = %s
+  AND created_at >= %s
+  AND created_at < %s
+GROUP BY channel_id
+ORDER BY channel_id"""
+    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    if rows is None:
+        return None
+    out = {}
+    for r in rows:
+        out[int(r[0])] = {
+            "dur": float(r[1]) if r[1] is not None else None,
+            "frt": float(r[2]) if r[2] is not None else None,
+        }
+    return out
+
 def now_shanghai():
     return datetime.now(SHANGHAI)
 
@@ -1115,6 +1146,9 @@ def _compute_channel_status(minutes):
         rpm_map, mini_rpm, other_rpm = {}, 0, 0
     else:
         rpm_map, mini_rpm, other_rpm = rpm_detail
+    # Per-channel avg total duration (s) and avg first-response/首字 time (ms)
+    # over the same window as the minute strip above.
+    latency = query_pg_avg_latency(start_ts, end_ts) or {}
     total_rpm = sum(rpm_map.values())
     bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
     bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
@@ -1134,7 +1168,9 @@ def _compute_channel_status(minutes):
                 cells.append({"t": lbl, "success": 0, "errors": 0, "total": 0, "rate": None})
         channels[str(ch_id)] = {"name": rates.get(ch_id, {}).get("name", ""),
                                 "rate": rates.get(ch_id, {}).get("rate", 0),
-                                "rpm": rpm_map.get(ch_id, 0), "cells": cells}
+                                "rpm": rpm_map.get(ch_id, 0), "cells": cells,
+                                "avg_dur": (latency.get(ch_id) or {}).get("dur"),
+                                "avg_frt": (latency.get(ch_id) or {}).get("frt")}
     return {"now": now.strftime("%Y-%m-%d %H:%M:%S"), "minutes": minutes,
             "channels": channels, "total_rpm": total_rpm,
             "mini_rpm": mini_rpm, "other_rpm": other_rpm, "error": False}
