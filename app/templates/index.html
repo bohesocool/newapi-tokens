@@ -931,7 +931,7 @@ async function toggleChannelStatus(id, enable, btn) {
 }
 let lastStatusData = null;  // 缓存最近一份渠道状态，供启停后局部刷新重渲染
 // ── 渠道卡片拖拽排序：仅顶部标题区(.cs-top)可拖，顺序持久化到 localStorage ──
-let _csDragId = null;
+let _csDragId = null, _csDragFromTop = false;  // mousedown 时记录按点是否落在标题区(.cs-top)
 function getCsOrder() { try { return JSON.parse(localStorage.getItem('csOrder') || '[]'); } catch(e) { return []; } }
 function saveCsOrder(arr) { localStorage.setItem('csOrder', JSON.stringify(arr)); }
 function resetCsOrder() { localStorage.removeItem('csOrder'); if (lastStatusData) renderChannelStatus(lastStatusData); }
@@ -947,15 +947,20 @@ function _csAfterEl(wrap, x, y) {
 function _csClearDrag(wrap) {
   wrap.querySelectorAll('.cs-card').forEach(c => c.classList.remove('dragging', 'drag-over'));
   _csDragId = null;
+  _csDragFromTop = false;
 }
 // 事件委托到稳定的 #channelStatus 容器（grid 每次刷新都会重建，不能绑在 grid 上）
 function bindCsDnD(wrap) {
   if (wrap._dndBound) return;
   wrap._dndBound = true;
+  // dragstart 的 e.target 总是被拖卡片本身(.cs-card)，无法据此判断按点；用 mousedown 记录是否按在标题区(.cs-top)
+  wrap.addEventListener('mousedown', e => {
+    _csDragFromTop = !!(e.target.closest('.cs-top') && e.target.closest('.cs-card'));
+  });
   wrap.addEventListener('dragstart', e => {
     const card = e.target.closest('.cs-card');
     if (!card) return;
-    if (!e.target.closest('.cs-top')) { e.preventDefault(); return; }  // 仅标题区可拖，按钮区域拖不动
+    if (!_csDragFromTop) { e.preventDefault(); return; }  // 仅从标题区发起的拖拽才放行
     _csDragId = card.dataset.id;
     card.classList.add('dragging');
     e.dataTransfer.effectAllowed = 'move';
