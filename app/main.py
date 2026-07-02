@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from psycopg_pool import ConnectionPool
@@ -83,6 +84,9 @@ ERROR_MIN_SAMPLE = 20         # 该分钟总调用 < 20 不参与判定，避免
 INSTANCE_OWNER = f"{os.getpid()}:{secrets.token_hex(4)}"
 
 app = FastAPI(title="NewAPI Monitor")
+# GZip all responses >1KB — chart.umd.min.js (205KB→~68KB) and index.html (82KB→~21KB)
+# are the big wins on first load. minimum_size=1024 avoids compressing tiny JSON polls.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -450,35 +454,16 @@ def query_pg_avg_latency(start_ts, end_ts):
     首字时长 is new-api's `frt` (first-response-time, ms) persisted inside the
     logs.other JSON for successful (type=2) text consume logs. frt is pulled via
     a regex substring over other::text so it works whether the column is text or
-    jsonb and never errors on malformed/empty JSON. Returns {channel_id:
-    {"dur": sec_or_None, "frt": ms_or_None}} or None."""
+    jsonb and never errors on malformed/empty JSON.
+
+    Single query groups by channel_id AND a mini/non-mini model_group, so this
+    one call also supplies the per-model averages that query_pg_model_avg_latency
+    used to fetch separately. Returns a tuple:
+      ({channel_id: {"dur", "frt"}}, {"model_group": {"dur", "frt"}})
+    or (None, None) on failure."""
     sql = """
 SELECT
   channel_id,
-  AVG(use_time),
-  AVG(NULLIF(substring(other::text FROM '"frt"[[:space:]]*:[[:space:]]*([-0-9.]+)'), '')::float8)
-FROM logs
-WHERE type = 2
-  AND token_name = %s
-  AND created_at >= %s
-  AND created_at < %s
-GROUP BY channel_id
-ORDER BY channel_id"""
-    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
-    if rows is None:
-        return None
-    out = {}
-    for r in rows:
-        out[int(r[0])] = {
-            "dur": float(r[1]) if r[1] is not None else None,
-            "frt": float(r[2]) if r[2] is not None else None,
-        }
-    return out
-
-def query_pg_model_avg_latency(start_ts, end_ts):
-    """Average request duration and first-response time split by mini/non-mini."""
-    sql = """
-SELECT
   CASE
     WHEN model_name ILIKE %s THEN 'mini'
     WHEN model_name NOT ILIKE %s THEN 'other'
@@ -491,20 +476,34 @@ WHERE type = 2
   AND token_name = %s
   AND created_at >= %s
   AND created_at < %s
-GROUP BY model_group"""
+GROUP BY channel_id, model_group
+ORDER BY channel_id"""
     rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
     if rows is None:
-        return None
-    out = {}
+        return None, None
+    by_ch = {}
+    by_model = {}
     for r in rows:
-        group = r[0]
-        if group not in ("mini", "other"):
-            continue
-        out[group] = {
-            "dur": float(r[1]) if r[1] is not None else None,
-            "frt": float(r[2]) if r[2] is not None else None,
+        ch_id = int(r[0])
+        group = r[1]
+        entry = {
+            "dur": float(r[2]) if r[2] is not None else None,
+            "frt": float(r[3]) if r[3] is not None else None,
         }
-    return out
+        by_ch[ch_id] = entry
+        if group in ("mini", "other"):
+            by_model[group] = entry
+    return by_ch, by_model
+
+# Per-model latency is now produced by the same query as query_pg_avg_latency
+# (it groups by channel_id, model_group). query_pg_model_avg_latency is kept as
+# a thin shim for any caller that still wants only the model-level view; it
+# shares the single query so no extra Postgres round-trip is added.
+def query_pg_model_avg_latency(start_ts, end_ts):
+    """Average request duration and first-response time split by mini/non-mini.
+    Shares the query with query_pg_avg_latency (no extra PG round-trip)."""
+    _, by_model = query_pg_avg_latency(start_ts, end_ts)
+    return by_model
 
 def now_shanghai():
     return datetime.now(SHANGHAI)
@@ -795,13 +794,18 @@ def save_hourly_snapshot(start_dt, channels_data, total_real, total_usd, total_c
     f.write_text(json.dumps(snap, ensure_ascii=False, indent=2))
     return f
 
-def load_snapshots(start_dt, end_dt):
-    """Load all hourly snapshots between start and end (exclusive)."""
+def _load_snapshots_full(start_dt, end_dt):
+    """Single-pass reader for all hourly snapshots in [start, end).
+
+    Returns (channels, total_real, total_usd, total_calls, missing, hourly):
+    the merged channel totals AND the per-hour (real_cost, usd, calls) list, so
+    /api/hourly can render its chart without re-reading the snapshot files."""
     channels = {}
     total_real = 0.0
     total_usd = 0.0
     total_calls = 0
     missing = []
+    hourly = []
     current = start_dt
     while current < end_dt:
         f = SNAPSHOT_DIR / f"{current.strftime('%Y-%m-%d')}_{current.hour:02d}.json"
@@ -821,9 +825,23 @@ def load_snapshots(start_dt, end_dt):
             total_real += snap.get("total_real", 0)
             total_usd += snap.get("total_usd", 0)
             total_calls += snap.get("total_calls", 0)
+            hourly.append({
+                "hour": current.hour,
+                "real_cost": snap.get("total_real", 0),
+                "usd": snap.get("total_usd", 0),
+                "calls": snap.get("total_calls", 0),
+            })
         else:
             missing.append(current.strftime("%m-%d %H:00"))
         current += timedelta(hours=1)
+    return channels, total_real, total_usd, total_calls, missing, hourly
+
+def load_snapshots(start_dt, end_dt):
+    """Load all hourly snapshots between start and end (exclusive).
+    Thin wrapper over _load_snapshots_full for callers that only need the
+    merged channel totals (the per-hour breakdown is dropped)."""
+    channels, total_real, total_usd, total_calls, missing, _hourly = \
+        _load_snapshots_full(start_dt, end_dt)
     return channels, total_real, total_usd, total_calls, missing
 
 def cleanup_daily_snapshots(date_str):
@@ -1111,8 +1129,9 @@ def _compute_hourly():
     
     # Today's accumulated (from snapshots + current hour)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    snap_channels, snap_real, snap_usd, snap_calls, missing = load_snapshots(today_start, cur_start)
-    
+    snap_channels, snap_real, snap_usd, snap_calls, missing, snap_hourly = \
+        _load_snapshots_full(today_start, cur_start)
+
     # Merge snapshot + current hour
     all_channels = {}
     for ch_id, d in snap_channels.items():
@@ -1128,26 +1147,21 @@ def _compute_hourly():
         all_channels[ch_id]["prompt_tokens"] += d["prompt_tokens"]
         all_channels[ch_id]["completion_tokens"] += d["completion_tokens"]
         all_channels[ch_id]["errors"] = all_channels[ch_id].get("errors", 0) + d.get("errors", 0)
-    
+
     today_total_real = snap_real + cur_total_real
     today_total_usd = snap_usd + cur_total_usd
     today_total_calls = snap_calls + cur_total_calls
-    
-    # Hourly breakdown for today (from snapshots)
+
+    # Hourly breakdown for today (from the snapshots read above). Missing hours
+    # before cur_start show as zero so the chart axis stays continuous.
+    snap_by_hour = {h["hour"]: h for h in snap_hourly}
     hourly = []
     for h in range(24):
         h_dt = today_start + timedelta(hours=h)
         if h_dt > now:
             break
-        f = SNAPSHOT_DIR / f"{h_dt.strftime('%Y-%m-%d')}_{h:02d}.json"
-        if f.exists():
-            snap = json.loads(f.read_text())
-            hourly.append({
-                "hour": h,
-                "real_cost": snap.get("total_real", 0),
-                "usd": snap.get("total_usd", 0),
-                "calls": snap.get("total_calls", 0),
-            })
+        if h in snap_by_hour:
+            hourly.append(snap_by_hour[h])
         elif h_dt < cur_start:
             hourly.append({"hour": h, "real_cost": 0, "usd": 0, "calls": 0})
     
@@ -1211,9 +1225,12 @@ def _compute_channel_status(minutes):
     else:
         rpm_map, mini_rpm, other_rpm = rpm_detail
     # Per-channel avg total duration (s) and avg first-response/首字 time (ms)
-    # over the same window as the minute strip above.
-    latency = query_pg_avg_latency(start_ts, end_ts) or {}
-    model_latency = query_pg_model_avg_latency(start_ts, end_ts) or {}
+    # over the same window as the minute strip above. One query groups by
+    # (channel_id, model_group) and yields both the per-channel and per-model
+    # latency views at once.
+    latency, model_latency = query_pg_avg_latency(start_ts, end_ts)
+    latency = latency or {}
+    model_latency = model_latency or {}
     total_rpm = sum(rpm_map.values())
     bucket_dts = [first_min + timedelta(minutes=i) for i in range(minutes)]
     bucket_idx = [int(b.timestamp()) // 60 for b in bucket_dts]
@@ -1365,7 +1382,9 @@ def api_system():
     # machine's CPU/memory — i.e. the server's overall load.
     vm = psutil.virtual_memory()
     return {
-        "cpu_percent": round(psutil.cpu_percent(interval=0.3), 1),
+        # interval=None: return the CPU % since the last call (sampled by the
+        # background thread below) instead of blocking 300ms on every request.
+        "cpu_percent": round(psutil.cpu_percent(interval=None), 1),
         "mem_percent": round(vm.percent, 1),
         "mem_used": vm.used,
         "mem_total": vm.total,
@@ -1902,6 +1921,15 @@ def _run_error_monitor():
 
 BALANCE_REFRESH_SECS = 600  # 后台每 10 分钟刷新一次各渠道余额
 
+def _run_cpu_sampler():
+    """Sample CPU % every 2s in the background so /api/system can return a
+    fresh reading with interval=None (non-blocking) instead of stalling 300ms."""
+    while True:
+        try:
+            psutil.cpu_percent(interval=2)
+        except Exception:
+            time.sleep(2)
+
 def _run_balance_poller():
     """Refresh configured channels' balances shortly after startup, then every 10 minutes."""
     time.sleep(30)  # let startup settle before the first (network) refresh
@@ -1936,22 +1964,41 @@ def _on_startup():
     threading.Thread(target=_run_scheduler, daemon=True).start()
     threading.Thread(target=_run_error_monitor, daemon=True).start()
     threading.Thread(target=_run_balance_poller, daemon=True).start()
+    # Keep a fresh CPU baseline so /api/system's cpu_percent(interval=None) is
+    # always computed against a <2s-old sample, without blocking the request.
+    threading.Thread(target=_run_cpu_sampler, daemon=True).start()
     print("[Startup] scheduler started", flush=True)
 
 # ── Static files & main page ──
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+# index.html / login.html are static files read on every `/` request — cache them
+# in memory so a page load doesn't hit disk (82KB read each time).
+_INDEX_HTML = (BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+_LOGIN_HTML = (BASE_DIR / "templates" / "login.html").read_text(encoding="utf-8")
+
+class _CacheControlStaticFiles(StaticFiles):
+    """StaticFiles with long browser cache headers for hashed-versioned assets.
+
+    chart.umd.min.js never changes content without a deploy, so a 7-day
+    immutable cache removes it from the critical path on repeat visits."""
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        if resp.status_code == 200 and path.endswith(".js"):
+            resp.headers["Cache-Control"] = "public, max-age=604800"
+        return resp
+
+app.mount("/static", _CacheControlStaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request):
     if is_authed_session(request):
         return RedirectResponse("/")
-    return (BASE_DIR / "templates" / "login.html").read_text(encoding="utf-8")
+    return _LOGIN_HTML
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     if not is_authed_session(request):
         return RedirectResponse("/login")
-    return (BASE_DIR / "templates" / "index.html").read_text(encoding="utf-8")
+    return _INDEX_HTML
 
 if __name__ == "__main__":
     import uvicorn

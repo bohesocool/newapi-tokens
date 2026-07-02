@@ -7,7 +7,7 @@
 <script>document.documentElement.setAttribute('data-theme', localStorage.getItem('theme')==='light'?'light':'dark');</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-<script src="/static/chart.umd.min.js"></script>
+<script src="/static/chart.umd.min.js" defer></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -568,7 +568,7 @@ let hourlyChart = null;
 let chartType = 'bar';
 let pollTimer = null;
 let sysTimer = null;
-const SYS_REFRESH_MS = 2000;  // CPU/内存独立快速刷新，接近实时
+const SYS_REFRESH_MS = 5000;  // CPU/内存独立刷新，5s 足够「接近实时」
 let lastHourlyData = null;
 let lastHistory = [];
 let currentApiKey = '';
@@ -1705,13 +1705,18 @@ async function testWebhook() {
 }
 
 // ── Init ──
-applyTheme(localStorage.getItem('theme') === 'light' ? 'light' : 'dark');
-document.getElementById('refreshSel').value = String(currentRefreshMs());
-loadDashboard();
-loadChannelStatus();
-loadSystem();
-loadTrend();
-applyRefresh();
+// chart.umd.min.js is loaded with `defer`, which executes after parsing but
+// before DOMContentLoaded — so Chart is guaranteed available by this point.
+function init() {
+  applyTheme(localStorage.getItem('theme') === 'light' ? 'light' : 'dark');
+  document.getElementById('refreshSel').value = String(currentRefreshMs());
+  loadDashboard();
+  loadChannelStatus();
+  loadSystem();
+  loadTrend();
+  applyRefresh();
+}
+window.addEventListener('DOMContentLoaded', init);
 </script>
 </body>
 </html>
