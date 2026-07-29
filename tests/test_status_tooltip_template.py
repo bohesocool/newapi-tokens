@@ -4,12 +4,13 @@ import unittest
 
 class StatusTooltipTemplateTests(unittest.TestCase):
     def test_status_bar_tooltips_are_plain_text(self):
-        html = Path("app/templates/index.html").read_text(encoding="utf-8")
+        # Tooltip rendering lives in the static JS after the template split.
+        js = Path("app/static/js/dashboard.js").read_text(encoding="utf-8")
 
-        self.assertIn("_csTip.textContent = bar.dataset.tip", html)
-        self.assertNotIn("tip = `<div", html)
-        self.assertIn("错误率", html)
-        self.assertIn("失败 ${errors.toLocaleString()} 次", html)
+        self.assertIn("_csTip.textContent = bar.dataset.tip", js)
+        self.assertNotIn("tip = `<div", js)
+        self.assertIn("错误率", js)
+        self.assertIn("失败 ${errors.toLocaleString()} 次", js)
 
 
 if __name__ == "__main__":

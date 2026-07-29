@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """NewAPI Monitor — settings stored here, also persisted to SQLite."""
-import os, json, sqlite3, glob, secrets, hashlib, hmac, time, urllib.request, urllib.error, http.cookiejar
+import os, json, sqlite3, glob, secrets, hashlib, hmac, time, re, urllib.request, urllib.error, http.cookiejar
 import psutil
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -146,6 +146,7 @@ def init_db():
         """)
         # Balance-check columns (added incrementally; ignore if already present).
         # bal_type: '' | 'sub2api' | 'newapi'; credentials stored in plaintext (self-hosted tool).
+        channel_cols = {r["name"] for r in conn.execute("PRAGMA table_info(channels)").fetchall()}
         for col, decl in [
             ("bal_type", "TEXT DEFAULT ''"),
             ("bal_url", "TEXT DEFAULT ''"),
@@ -155,11 +156,21 @@ def init_db():
             ("bal_value", "REAL"),
             ("bal_checked_at", "TEXT DEFAULT ''"),
             ("bal_error", "TEXT DEFAULT ''"),
+            # 上游倍率自动同步：rate = 全局系数 - upstream_rate * upstream_rate_factor
+            ("upstream_rate", "REAL"),
+            ("upstream_rate_factor", "REAL NOT NULL DEFAULT 1"),
+            ("upstream_rate_source", "TEXT DEFAULT ''"),
+            ("upstream_rate_checked_at", "TEXT DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE channels ADD COLUMN {col} {decl}")
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # 渠道 26 的上游倍率是 Plus 池整体倍率，实际成本需要再 ×0.1。
+        # 只在首次增加该列时初始化，避免覆盖之后你手动改过的折算。
+        if "upstream_rate_factor" not in channel_cols:
+            conn.execute("UPDATE channels SET upstream_rate_factor = 0.1 WHERE id = 26")
+            conn.commit()
         # Seed default channels if empty
         row = conn.execute("SELECT count(*) FROM channels").fetchone()
         if row[0] == 0:
@@ -527,14 +538,289 @@ def get_rate_at(channel_id, target_dt):
 def get_rates_at(target_dt):
     """Get all channel rates at a specific point in time."""
     with get_db() as conn:
-        rows = conn.execute("SELECT id, name, rate FROM channels").fetchall()
-    return {r["id"]: {"name": r["name"], "rate": get_rate_at(r["id"], target_dt)} for r in rows}
+        rows = conn.execute("SELECT id, name, rate, upstream_rate, upstream_rate_factor FROM channels").fetchall()
+    return {r["id"]: {"name": r["name"], "rate": get_rate_at(r["id"], target_dt),
+                       "upstream_rate": r["upstream_rate"],
+                       "upstream_rate_factor": r["upstream_rate_factor"]} for r in rows}
 
 def get_rates():
     """Get channel rates from DB."""
     with get_db() as conn:
-        rows = conn.execute("SELECT id, name, rate FROM channels ORDER BY id").fetchall()
-        return {r["id"]: {"name": r["name"], "rate": r["rate"]} for r in rows}
+        rows = conn.execute("""
+            SELECT id, name, rate, upstream_rate, upstream_rate_factor,
+                   upstream_rate_source, upstream_rate_checked_at, bal_url
+            FROM channels ORDER BY id
+        """).fetchall()
+        return {r["id"]: {"name": r["name"], "rate": r["rate"],
+                          "upstream_rate": r["upstream_rate"],
+                          "upstream_rate_factor": r["upstream_rate_factor"],
+                          "upstream_rate_source": r["upstream_rate_source"],
+                          "upstream_rate_checked_at": r["upstream_rate_checked_at"],
+                          # bal_url is seeded from the new-api channel base_url during sync;
+                          # expose it to the dashboard as the upstream URL for quick open.
+                          "bal_url": r["bal_url"] or ""}
+                for r in rows}
+
+# ── 上游倍率自动同步 ──
+DEFAULT_TARGET_GROUP_RATE = 0.18
+
+
+def _float_setting(key, default):
+    try:
+        return float(get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_target_group_rate():
+    """全局系数：最终本地系数 = 全局系数 - 上游倍率 × 折算。"""
+    return _float_setting("rate_auto_target", DEFAULT_TARGET_GROUP_RATE)
+
+
+def compute_auto_rate(upstream_rate, factor=None, target_rate=None):
+    if upstream_rate is None:
+        return None
+    factor = 1.0 if factor is None else float(factor)
+    target_rate = get_target_group_rate() if target_rate is None else float(target_rate)
+    # 保留 6 位足够覆盖 0.001 级输入，同时避免 0.139999999 这类浮点噪音。
+    return round(max(target_rate - float(upstream_rate) * factor, 0.0), 6)
+
+
+def _norm_match_text(s):
+    s = (s or "").lower()
+    s = re.sub(r"[\s_\-—–·,，。/\\()（）\[\]【】{}]+", "", s)
+    for token in ("chatgpt", "高并发", "官方", "通道", "渠道"):
+        s = s.replace(token, "")
+    return s
+
+
+def _effective_key_rate(item, user_group_rates=None):
+    """Return the upstream multiplier for a Sub2API key item."""
+    group = item.get("group") or {}
+    gid = item.get("group_id") or group.get("id")
+    rate = None
+    rates = user_group_rates or {}
+    if gid is not None:
+        for k in (gid, str(gid)):
+            if isinstance(rates, dict) and rates.get(k) is not None:
+                rate = rates.get(k)
+                break
+    if rate is None:
+        rate = group.get("rate_multiplier")
+    if rate is None:
+        return None
+    try:
+        return float(rate)
+    except (TypeError, ValueError):
+        return None
+
+
+def _match_upstream_key(channel_info, key_items):
+    """Best-effort map a local new-api channel to one Sub2API key on the same upstream.
+
+    Same upstream with one active priced key is unambiguous. For multi-key upstreams,
+    match by local channel name containing the upstream key name or group name tokens
+    (e.g. “麻豆plus特惠” -> key “特惠”, “兜底-mini” -> group/key “兜底”).
+    """
+    priced = [k for k in key_items if k.get("rate") is not None and (k.get("status") in (None, "active"))]
+    if not priced:
+        return None
+    if len(priced) == 1:
+        return priced[0]
+    cname = _norm_match_text(channel_info.get("name") or "")
+    best = None
+    best_score = 0
+    strong_tokens = ("稳定", "特惠", "兜底", "mini", "team")
+    weak_tokens = ("plus", "pro")  # 太常见，只作弱信号，不能压过“兜底/特惠/稳定”
+    for item in priced:
+        group = item.get("group") or {}
+        candidates = [item.get("name") or "", group.get("name") or ""]
+        score = 0
+        for cand in candidates:
+            n = _norm_match_text(cand)
+            if not n:
+                continue
+            if len(n) >= 2 and (n in cname or cname in n):
+                score = max(score, min(len(n), 20))
+            for token in strong_tokens:
+                if token in cname and token in n:
+                    score = max(score, 100 + len(token))
+            for token in weak_tokens:
+                if token in cname and token in n:
+                    score = max(score, 10 + len(token))
+        if score > best_score:
+            best = item
+            best_score = score
+    return best if best_score > 0 else None
+
+
+def _fetch_sub2api_key_rates(cfg):
+    """Fetch Sub2API /api/v1/keys and return (items, new_rt, error)."""
+    base = (cfg.get("bal_url") or "").strip().rstrip("/")
+    if not base:
+        return None, cfg.get("bal_rt") or "", "未配置上游 URL"
+    api = base if base.endswith("/api/v1") else base + "/api/v1"
+    account = cfg.get("bal_account") or ""
+    password = cfg.get("bal_password") or ""
+    rt = cfg.get("bal_rt") or ""
+    access = None
+    new_rt = rt
+    if rt:
+        st, body = _http_request("POST", api + "/auth/refresh", body={"refresh_token": rt})
+        if st == 200 and isinstance(body, dict) and body.get("code") == 0:
+            d = body.get("data") or {}
+            access = d.get("access_token")
+            new_rt = d.get("refresh_token") or rt
+    if not access and account and password:
+        st, body = _http_request("POST", api + "/auth/login",
+                                 body={"email": account, "password": password, "turnstile_token": ""})
+        if st == 200 and isinstance(body, dict) and body.get("code") == 0:
+            d = body.get("data") or {}
+            access = d.get("access_token")
+            new_rt = d.get("refresh_token") or new_rt
+        else:
+            return None, new_rt, _api_err(body, st, "上游登录失败")
+    if not access:
+        return None, new_rt, "未获取到上游 access_token"
+
+    user_group_rates = {}
+    st, body = _http_request("GET", api + "/groups/rates", headers={"Authorization": "Bearer " + access})
+    if st == 200 and isinstance(body, dict) and body.get("code") == 0:
+        user_group_rates = body.get("data") or {}
+
+    items = []
+    page = 1
+    while page <= 20:
+        st, body = _http_request("GET", f"{api}/keys?page={page}&page_size=100",
+                                 headers={"Authorization": "Bearer " + access})
+        if st != 200 or not isinstance(body, dict) or body.get("code") != 0:
+            return None, new_rt, _api_err(body, st, "获取上游 keys 失败")
+        data = body.get("data") or {}
+        batch = data.get("items") or []
+        for item in batch:
+            if not isinstance(item, dict):
+                continue
+            item = dict(item)
+            item["rate"] = _effective_key_rate(item, user_group_rates)
+            items.append(item)
+        total = data.get("total") or len(items)
+        if len(items) >= total or not batch:
+            break
+        page += 1
+    return items, new_rt, None
+
+
+def fetch_upstream_rates_for_channels(remote_channels):
+    """Return {channel_id: {upstream_rate, source}} by querying each bal_url once.
+
+    Credentials come from local balance config, but matching covers every remote
+    new-api channel with the same base_url too. That means a newly-created channel
+    gets its auto rate on the first “从 new-api 同步”, not only after bal_url has
+    been seeded locally.
+    """
+    result = {}
+    errors = {}
+    groups = _balance_url_groups()
+    remote_by_url = {}
+    for cid_str, info in (remote_channels or {}).items():
+        norm = (info.get("base_url") or "").strip().rstrip("/")
+        if norm:
+            remote_by_url.setdefault(norm, {})[str(cid_str)] = info
+    for norm_url, members in groups.items():
+        if not members:
+            continue
+        rep = dict(members[0])
+        if (rep.get("bal_type") or "").strip() != "sub2api":
+            errors[norm_url] = "仅 sub2api 上游支持自动倍率"
+            continue
+        key_items, new_rt, err = _fetch_sub2api_key_rates(rep)
+        if new_rt and new_rt != (rep.get("bal_rt") or ""):
+            with get_db() as conn:
+                conn.execute("UPDATE channels SET bal_rt = ? WHERE id = ?", (new_rt, rep["id"]))
+                conn.commit()
+        if err:
+            errors[norm_url] = err
+            continue
+        local_by_id = {str(m["id"]): dict(m) for m in members}
+        target_infos = dict(remote_by_url.get(norm_url, {}))
+        # If a local row has no corresponding remote channel (should be rare), still
+        # allow matching by its local name so stale/manual rows don't break the group.
+        for cid_str, m in local_by_id.items():
+            target_infos.setdefault(cid_str, {"name": m.get("name") or "", "base_url": norm_url})
+        for cid_str, ch_info in target_infos.items():
+            try:
+                cid = int(cid_str)
+            except (TypeError, ValueError):
+                continue
+            if not ch_info.get("name") and cid_str in local_by_id:
+                ch_info = {**ch_info, "name": local_by_id[cid_str].get("name") or ""}
+            match = _match_upstream_key(ch_info, key_items or [])
+            if not match:
+                errors[str(cid)] = f"未匹配到上游 key（{norm_url}）"
+                continue
+            group = match.get("group") or {}
+            result[cid] = {
+                "upstream_rate": match.get("rate"),
+                "source": f"{norm_url} · {match.get('name') or 'key'} · {group.get('name') or ('group ' + str(match.get('group_id')))}",
+            }
+    return result, errors
+
+
+def _apply_auto_rate_to_channel(conn, cid, upstream_rate, source, now, *, insert_if_missing=None):
+    row = conn.execute(
+        "SELECT id, rate, upstream_rate_factor FROM channels WHERE id = ?", (cid,)
+    ).fetchone()
+    if row:
+        old_rate = float(row["rate"] or 0)
+        factor = float(row["upstream_rate_factor"] if row["upstream_rate_factor"] is not None else 1)
+        new_rate = compute_auto_rate(upstream_rate, factor)
+        conn.execute(
+            """
+            UPDATE channels
+            SET rate = ?, upstream_rate = ?, upstream_rate_source = ?,
+                upstream_rate_checked_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (new_rate, upstream_rate, source, now, now, cid),
+        )
+        changed = abs(new_rate - old_rate) > 1e-9
+        if changed:
+            conn.execute(
+                "INSERT INTO rate_history (channel_id, old_rate, new_rate, changed_at, notes) VALUES (?, ?, ?, ?, ?)",
+                (cid, old_rate, new_rate, now, "auto-sync upstream rate"),
+            )
+        return changed, new_rate
+    if insert_if_missing:
+        factor = insert_if_missing.get("upstream_rate_factor", 0.1 if cid == 26 else 1.0)
+        new_rate = compute_auto_rate(upstream_rate, factor)
+        conn.execute(
+            """
+            INSERT INTO channels (id, name, rate, bal_url, upstream_rate, upstream_rate_factor,
+                                  upstream_rate_source, upstream_rate_checked_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (cid, insert_if_missing.get("name") or "", new_rate, insert_if_missing.get("base_url") or "",
+             upstream_rate, factor, source, now, now),
+        )
+        return True, new_rate
+    return False, None
+
+
+def recompute_cached_auto_rates():
+    """Recompute rates for channels that already have upstream_rate cached."""
+    now = now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
+    updated = 0
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, upstream_rate, upstream_rate_source FROM channels WHERE upstream_rate IS NOT NULL").fetchall()
+        for r in rows:
+            changed, _ = _apply_auto_rate_to_channel(
+                conn, int(r["id"]), float(r["upstream_rate"]), r["upstream_rate_source"] or "cached", now
+            )
+            if changed:
+                updated += 1
+        conn.commit()
+    invalidate_dashboard_cache()
+    return updated
 
 # ── 渠道余额查询（上游 sub2api / newapi）──
 # 凭据以明文存于 channels 表（自托管个人工具）。两种上游最终都换算为 USD 余额。
@@ -880,6 +1166,7 @@ def save_daily_history(date_str, channels, total_real, total_usd, total_calls):
 class ChannelUpdate(BaseModel):
     name: Optional[str] = None
     rate: Optional[float] = None
+    upstream_rate_factor: Optional[float] = None
 
 class ChannelCreate(BaseModel):
     id: int
@@ -904,32 +1191,50 @@ class CostRecordBody(BaseModel):
 @app.get("/api/channels", dependencies=[Depends(require_auth)])
 def api_get_channels():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, name, rate, updated_at FROM channels ORDER BY id").fetchall()
+        rows = conn.execute("""
+            SELECT id, name, rate, upstream_rate, upstream_rate_factor,
+                   upstream_rate_source, upstream_rate_checked_at, updated_at
+            FROM channels ORDER BY id
+        """).fetchall()
         return [dict(r) for r in rows]
 
 @app.put("/api/channels/{ch_id}", dependencies=[Depends(require_auth)])
 def api_update_channel(ch_id: int, body: ChannelUpdate):
     with get_db() as conn:
-        row = conn.execute("SELECT id, rate FROM channels WHERE id = ?", (ch_id,)).fetchone()
+        row = conn.execute("SELECT id, rate, upstream_rate, upstream_rate_source FROM channels WHERE id = ?", (ch_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Channel not found")
-        old_rate = row["rate"]
+        old_rate = float(row["rate"] or 0)
         updates = []
         params = []
+        manual_rate = False
         if body.name is not None:
             updates.append("name = ?")
             params.append(body.name)
+        if body.upstream_rate_factor is not None:
+            if body.upstream_rate_factor < 0:
+                raise HTTPException(400, "折算必须 ≥ 0")
+            updates.append("upstream_rate_factor = ?")
+            params.append(body.upstream_rate_factor)
         if body.rate is not None:
             updates.append("rate = ?")
             params.append(body.rate)
+            manual_rate = True
+        elif body.upstream_rate_factor is not None and row["upstream_rate"] is not None:
+            # 修改折算后，基于已缓存的上游倍率立即重算最终系数。
+            updates.append("rate = ?")
+            params.append(compute_auto_rate(row["upstream_rate"], body.upstream_rate_factor))
         if updates:
             updates.append("updated_at = datetime('now')")
             params.append(ch_id)
             conn.execute(f"UPDATE channels SET {', '.join(updates)} WHERE id = ?", params)
-            if body.rate is not None and body.rate != old_rate:
+            new_rate_row = conn.execute("SELECT rate FROM channels WHERE id = ?", (ch_id,)).fetchone()
+            new_rate = float(new_rate_row["rate"] or 0)
+            if abs(new_rate - old_rate) > 1e-9:
                 conn.execute(
-                    "INSERT INTO rate_history (channel_id, old_rate, new_rate, changed_at) VALUES (?, ?, ?, ?)",
-                    (ch_id, old_rate, body.rate, now_shanghai().strftime("%Y-%m-%d %H:%M:%S")),
+                    "INSERT INTO rate_history (channel_id, old_rate, new_rate, changed_at, notes) VALUES (?, ?, ?, ?, ?)",
+                    (ch_id, old_rate, new_rate, now_shanghai().strftime("%Y-%m-%d %H:%M:%S"),
+                     "manual" if manual_rate else "factor recompute"),
                 )
             conn.commit()
             invalidate_dashboard_cache()
@@ -939,8 +1244,8 @@ def api_update_channel(ch_id: int, body: ChannelUpdate):
 def api_create_channel(body: ChannelCreate):
     with get_db() as conn:
         try:
-            conn.execute("INSERT INTO channels (id, name, rate) VALUES (?, ?, ?)",
-                        (body.id, body.name, body.rate))
+            conn.execute("INSERT INTO channels (id, name, rate, upstream_rate_factor) VALUES (?, ?, ?, ?)",
+                        (body.id, body.name, body.rate, 0.1 if body.id == 26 else 1.0))
             conn.commit()
         except sqlite3.IntegrityError:
             raise HTTPException(409, "Channel already exists")
@@ -1023,8 +1328,16 @@ def api_get_control_status():
     """Return {channel_id: enabled_bool} for all new-api channels, from the upstream."""
     if not _control_settings()[0]:
         return {"configured": False, "statuses": {}}
-    statuses = fetch_newapi_channel_status()
-    return {"configured": True, "statuses": statuses or {}, "error": statuses is None}
+    channels = fetch_newapi_channels()
+    if channels is None:
+        return {"configured": True, "statuses": {}, "channels": {}, "error": True}
+    return {"configured": True,
+            "statuses": {cid: info["enabled"] for cid, info in channels.items()},
+            # Safe to expose: this is the upstream/base URL already visible in the
+            # new-api channel editor, not credentials. The dashboard card uses it
+            # for the “打开上游” new-tab shortcut.
+            "channels": channels,
+            "error": False}
 
 class ChannelStatusBody(BaseModel):
     status: int  # 1 = enable, 2 = disable (new-api manual disabled)
@@ -1046,33 +1359,38 @@ def api_set_channel_status(ch_id: int, body: ChannelStatusBody):
 
 @app.post("/api/channels/sync", dependencies=[Depends(require_session)])
 def api_sync_channels():
-    """Pull all channels from new-api and upsert into the local channels table.
-    New channels are inserted with rate=0 (configure manually). For existing
-    channels only the name is refreshed — rate / balance config are never touched.
-    For NEW channels, bal_url is seeded from new-api's base_url (the channel's
-    upstream URL), so same-upstream channels can auto-group for balance checking
-    without you typing URLs by hand. For EXISTING channels whose bal_url is still
-    blank, the same seed is backfilled (never overwriting one you set manually).
-    Returns counts for the UI."""
+    """Pull all channels from new-api and reconcile the local channels table.
+
+    Also refresh upstream Sub2API multipliers when balance credentials are configured:
+      local rate = 全局系数 - 上游倍率 × 折算
+    Channel 26 keeps a default 折算=0.1 because its Plus-pool multiplier represents
+    a larger upstream bucket than the real token cost.
+    """
     if not _control_settings()[0]:
         raise HTTPException(400, "未配置 new-api 控制凭据，无法同步")
     full = fetch_newapi_channels()
     if full is None:
         raise HTTPException(502, "拉取 new-api 渠道失败")
-    added, renamed = 0, 0
+    upstream_rates, upstream_errors = fetch_upstream_rates_for_channels(full)
+    added, renamed, deleted, rate_updated, upstream_matched = 0, 0, 0, 0, 0
     now = now_shanghai().strftime("%Y-%m-%d %H:%M:%S")
+    remote_ids = set()
     with get_db() as conn:
-        existing = {r["id"]: r["name"] for r in
-                    conn.execute("SELECT id, name FROM channels").fetchall()}
+        existing_rows = conn.execute(
+            "SELECT id, name, rate, upstream_rate_factor FROM channels"
+        ).fetchall()
+        existing = {r["id"]: dict(r) for r in existing_rows}
         for cid_str, info in full.items():
             try:
                 cid = int(cid_str)
             except ValueError:
                 continue
+            remote_ids.add(cid)
             name = info.get("name") or ""
             base_url = info.get("base_url") or ""
+            auto = upstream_rates.get(cid)
             if cid in existing:
-                if existing[cid] != name:
+                if existing[cid]["name"] != name:
                     conn.execute("UPDATE channels SET name = ?, updated_at = ? WHERE id = ?",
                                  (name, now, cid))
                     renamed += 1
@@ -1083,15 +1401,40 @@ def api_sync_channels():
                 ).fetchone()["bal_url"] or "").strip():
                     conn.execute("UPDATE channels SET bal_url = ? WHERE id = ?",
                                  (base_url, cid))
+                if auto and auto.get("upstream_rate") is not None:
+                    upstream_matched += 1
+                    changed, _ = _apply_auto_rate_to_channel(
+                        conn, cid, auto["upstream_rate"], auto.get("source") or "upstream", now
+                    )
+                    if changed:
+                        rate_updated += 1
             else:
                 # base_url 来自 new-api 渠道配置里的上游地址；为空时（指向内置
-                # 中转的渠道）bal_url 留空，该渠道不参与余额查询，直到你手填。
-                conn.execute("INSERT INTO channels (id, name, rate, bal_url) VALUES (?, ?, 0, ?)",
-                             (cid, name, info.get("base_url") or ""))
+                # 中转的渠道）bal_url 留空，该渠道不参与余额/倍率查询，直到你手填。
+                if auto and auto.get("upstream_rate") is not None:
+                    upstream_matched += 1
+                    _apply_auto_rate_to_channel(
+                        conn, cid, auto["upstream_rate"], auto.get("source") or "upstream", now,
+                        insert_if_missing={"name": name, "base_url": base_url,
+                                           "upstream_rate_factor": 0.1 if cid == 26 else 1.0},
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO channels (id, name, rate, bal_url, upstream_rate_factor) VALUES (?, ?, 0, ?, ?)",
+                        (cid, name, base_url, 0.1 if cid == 26 else 1.0),
+                    )
                 added += 1
+        # new-api 已删除的渠道：本地渠道管理同步删除
+        stale_ids = [cid for cid in existing if cid not in remote_ids]
+        if stale_ids:
+            conn.executemany("DELETE FROM channels WHERE id = ?",
+                             [(cid,) for cid in stale_ids])
+            deleted = len(stale_ids)
         conn.commit()
     invalidate_dashboard_cache()
-    return {"ok": True, "added": added, "renamed": renamed,
+    return {"ok": True, "added": added, "renamed": renamed, "deleted": deleted,
+            "rate_updated": rate_updated, "upstream_matched": upstream_matched,
+            "upstream_errors": upstream_errors, "target_rate": get_target_group_rate(),
             "total": len(full)}
 
 @app.get("/api/hourly", dependencies=[Depends(require_auth)])
@@ -1260,8 +1603,11 @@ def _compute_channel_status(minutes):
                               "total": total, "rate": (c["success"] / total) if total else None})
             else:
                 cells.append({"t": lbl, "success": 0, "errors": 0, "total": 0, "rate": None})
-        channels[str(ch_id)] = {"name": rates.get(ch_id, {}).get("name", ""),
-                                "rate": rates.get(ch_id, {}).get("rate", 0),
+        rate_info = rates.get(ch_id, {})
+        upstream_url = (rate_info.get("bal_url") or "").strip()
+        channels[str(ch_id)] = {"name": rate_info.get("name", ""),
+                                "rate": rate_info.get("rate", 0),
+                                "upstream_url": upstream_url,
                                 "rpm": rpm_map.get(ch_id, 0), "cells": cells,
                                 "avg_dur": (latency.get(ch_id) or {}).get("dur"),
                                 "avg_frt": (latency.get(ch_id) or {}).get("frt")}
@@ -1410,6 +1756,9 @@ class ControlConfigBody(BaseModel):
     token: Optional[str] = None
     user_id: Optional[str] = None
 
+class RateAutoSettingsBody(BaseModel):
+    target_rate: Optional[float] = None
+
 @app.post("/api/login")
 def api_login(body: LoginBody, request: Request):
     ip = _client_ip(request)
@@ -1444,6 +1793,22 @@ def api_me(request: Request):
 @app.get("/api/settings", dependencies=[Depends(require_session)])
 def api_get_settings():
     return {"api_key": get_setting("api_key")}
+
+@app.get("/api/settings/rate-auto", dependencies=[Depends(require_session)])
+def api_get_rate_auto_settings():
+    return {
+        "target_rate": get_target_group_rate(),
+        "formula": "rate = target_rate - upstream_rate * upstream_rate_factor",
+    }
+
+@app.post("/api/settings/rate-auto", dependencies=[Depends(require_session)])
+def api_set_rate_auto_settings(body: RateAutoSettingsBody):
+    if body.target_rate is not None:
+        if body.target_rate < 0:
+            raise HTTPException(400, "全局系数必须 ≥ 0")
+        set_setting("rate_auto_target", str(body.target_rate))
+    updated = recompute_cached_auto_rates()
+    return {"ok": True, "target_rate": get_target_group_rate(), "updated": updated}
 
 @app.post("/api/settings/regenerate-key", dependencies=[Depends(require_session)])
 def api_regenerate_key():
@@ -1539,6 +1904,8 @@ def fetch_newapi_channels():
                 "name": ch.get("name") or "",
                 "enabled": (ch.get("status") == NA_STATUS_ENABLED),
                 "base_url": (ch.get("base_url") or "").strip(),
+                "models": ch.get("models") or "",
+                "group": ch.get("group") or "",
             }
         total = data.get("total") or 0
         if len(out) >= total or not items:

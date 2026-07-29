@@ -61,6 +61,8 @@ tr:hover{background:rgba(127,127,127,.04)}
 .rate-input:focus{outline:none;border-color:var(--accent)}
 .name-input{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:6px;padding:4px 8px;width:120px;font-size:14px}
 .name-input:focus{outline:none;border-color:var(--accent)}
+.rate-meta{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-weight:700;color:var(--accent2)}
+.rate-src{max-width:210px;margin-top:3px;color:var(--text2);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .btn{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px;font-weight:500;transition:opacity .2s}
 .btn:hover{opacity:.85}
 .btn-sm{padding:4px 10px;font-size:12px}
@@ -94,8 +96,8 @@ tr:hover{background:rgba(127,127,127,.04)}
 .ch-amount .usd{font-size:12px;color:var(--text2)}
 
 /* Channel status monitor (uptime-style cards) */
-.cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:16px}
-.cs-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow)}
+.cs-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px;align-items:stretch}
+.cs-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;box-shadow:var(--shadow);display:flex;flex-direction:column;min-height:100%;height:100%}
 .overall-status{margin-bottom:16px;padding:16px 18px}
 .os-row{display:grid;grid-template-columns:140px 110px 180px minmax(0,1fr);gap:14px;align-items:center}
 .os-row + .os-row{margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
@@ -116,20 +118,33 @@ tr:hover{background:rgba(127,127,127,.04)}
 .cs-top:active{cursor:grabbing}
 .cs-card.dragging{opacity:.4}
 .cs-card.drag-over{outline:2px dashed var(--accent);outline-offset:2px}
-.cs-top{display:flex;align-items:center;gap:10px}
-.cs-ic{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;flex-shrink:0}
-.cs-title{flex:1;font-size:15px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cs-top{display:flex;align-items:flex-start;gap:10px;min-height:34px}
+.cs-ic{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:15px;flex-shrink:0;margin-top:1px}
+/* 名称必须完整显示：允许换行，不再 ellipsis 截断 */
+.cs-title{flex:1;min-width:0;font-size:15px;font-weight:700;line-height:1.35;word-break:break-word;overflow-wrap:anywhere;white-space:normal}
+.cs-badges{display:flex;flex-wrap:wrap;gap:6px;align-items:center;justify-content:flex-end;flex-shrink:0;max-width:46%}
 .cs-badge2{font-size:12px;font-weight:600;padding:3px 11px;border-radius:20px;white-space:nowrap}
-.cs-tags{display:flex;gap:6px;margin:11px 0 14px}
+.cs-tags{display:flex;gap:6px;margin:11px 0 14px;flex-wrap:wrap;min-height:24px}
 .cs-tag{font-size:11px;color:var(--text2);background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:2px 8px}
-.cs-metrics{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:8px}
-.cs-metric{flex:1 1 80px;min-width:0}
-.cs-metric .ml{font-size:11px;color:var(--text2);display:flex;align-items:center;gap:5px}
+/* 指标区固定 3 列，避免卡片间换行不一致 */
+.cs-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px 10px;margin-bottom:8px;min-height:112px}
+.cs-metric{min-width:0}
+.cs-metric .ml{font-size:11px;color:var(--text2);display:flex;align-items:center;gap:5px;white-space:nowrap}
 .cs-metric .mv{font-size:17px;font-weight:700;margin-top:4px}
-.cs-avail{display:flex;align-items:flex-end;justify-content:space-between;margin:12px 0;gap:8px}
+.cs-avail{display:flex;align-items:flex-end;justify-content:space-between;margin:12px 0;gap:8px;min-height:42px}
 .cs-avail .al{font-size:11px;color:var(--text2)}
 .cs-avail .av{font-size:30px;font-weight:800;letter-spacing:-1px;line-height:1}
 .cs-avail .av small{font-size:14px;font-weight:700;margin-left:2px}
+/* 余额区始终占位，保证有/无余额配置时卡片对齐 */
+.cs-bal{display:flex;align-items:center;justify-content:space-between;gap:8px;border-top:1px dashed var(--border);margin-top:2px;padding-top:10px;min-height:40px}
+.cs-bal .al{font-size:11px;color:var(--text2);min-width:0}
+.cs-bal-val{display:flex;align-items:center;gap:8px;flex-shrink:0}
+.cs-bal-empty{opacity:.72}
+.cs-ctrl{display:flex;gap:8px;margin-top:10px;min-height:30px;align-items:center}
+.cs-ctrl-empty{visibility:hidden;pointer-events:none}
+.cs-open-upstream{text-decoration:none;display:inline-flex;align-items:center;justify-content:center}
+/* 底部时间条贴齐卡片底部，使同行卡片条带对齐 */
+.cs-bottom{margin-top:auto;padding-top:10px}
 .cs-striprow{display:flex;justify-content:space-between;font-size:10px;color:var(--text2);margin-bottom:5px}
 .cs-bars{display:flex;gap:2px;align-items:stretch;height:30px}
 .cs-bar{flex:1;min-width:2px;border-radius:1.5px;background:rgba(127,127,127,.12);cursor:pointer;transition:opacity .18s ease,transform .18s cubic-bezier(.2,.8,.2,1);transform-origin:center bottom}

@@ -8,7 +8,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="/static/chart.umd.min.js" defer></script>
-<link rel="stylesheet" href="/static/css/dashboard.css">
+<link rel="stylesheet" href="/static/css/dashboard.css?v=20260729">
 </head>
 <body>
 <div class="container">
@@ -160,9 +160,14 @@
         <span>渠道系数管理</span>
         <button class="btn btn-sm btn-ghost" id="syncChBtn" onclick="syncChannels()">从 new-api 同步</button>
       </div>
+      <div style="margin-bottom:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <span style="color:var(--text2);font-size:12px">全局系数</span>
+        <input id="rateAutoTarget" class="rate-input" type="number" step="0.001" style="width:90px" onchange="saveRateAutoTarget()">
+        <span id="rateAutoHint" style="color:var(--text2);font-size:12px">最终系数 = 全局系数 − 上游倍率 × 折算</span>
+      </div>
       <table id="channelsTable">
         <thead>
-          <tr><th>ID</th><th>名称</th><th>系数</th><th>余额查询</th><th>更新时间</th><th>操作</th></tr>
+          <tr><th>ID</th><th>名称</th><th>系数</th><th>上游倍率</th><th>折算</th><th>余额查询</th><th>更新时间</th><th>操作</th></tr>
         </thead>
         <tbody id="channelsBody"></tbody>
       </table>
@@ -379,6 +384,6 @@
   </div>
 </div>
 
-<script src="/static/js/dashboard.js" defer></script>
+<script src="/static/js/dashboard.js?v=20260729" defer></script>
 </body>
 </html>

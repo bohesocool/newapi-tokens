@@ -12,6 +12,17 @@ services:
     networks:
       - newapi-net
 
+  tg-relay:
+    build: ./relay
+    container_name: newapi-tg-relay
+    restart: unless-stopped
+    ports:
+      - "9218:9218"
+    env_file:
+      - .env
+    networks:
+      - newapi-net
+
 networks:
   newapi-net:
     external: true

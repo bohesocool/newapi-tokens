@@ -95,7 +95,7 @@ function switchTab(tab) {
   event.target.classList.add('active');
   document.querySelectorAll('[id^="tab-"]').forEach(el => el.style.display = 'none');
   document.getElementById('tab-' + tab).style.display = '';
-  if (tab === 'channels') loadChannels();
+  if (tab === 'channels') { loadRateAutoSettings(); loadChannels(); }
   if (tab === 'history') loadHistory();
   if (tab === 'cost') loadCost();
   if (tab === 'settings') loadSettings();
@@ -381,6 +381,7 @@ function renderTrend(series) {
 let lastBalances = {};
 let controlConfigured = false;   // new-api 启停控制是否已配置
 let lastControlStatus = {};      // {channel_id: enabled_bool}
+let lastControlChannels = {};    // {channel_id: {base_url, ...}} from new-api control API
 async function loadChannelStatus() {
   if (_csInFlight) return;
   _csInFlight = true;
@@ -396,6 +397,7 @@ async function loadChannelStatus() {
         const c = await ctrlR.json();
         controlConfigured = !!c.configured;
         lastControlStatus = c.statuses || {};
+        lastControlChannels = c.channels || {};
       } catch(e) {}
     }
     renderChannelStatus(await statusR.json());
@@ -513,6 +515,16 @@ function buildStatusBars(cells) {
 }
 const fmtDur = s => (s == null || isNaN(s)) ? '—' : (s >= 60 ? `${Math.floor(s / 60)}m${Math.round(s % 60)}s` : `${s.toFixed(1)}s`);
 const fmtFrt = ms => (ms == null || isNaN(ms)) ? '—' : (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`);
+function normalizeHttpUrl(raw) {
+  const s = String(raw == null ? '' : raw).trim();
+  if (!s) return '';
+  try {
+    const u = new URL(/^https?:\/\//i.test(s) ? s : 'https://' + s);
+    return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : '';
+  } catch(e) {
+    return '';
+  }
+}
 function renderOverallStatus(data, refreshLbl) {
   const el = document.getElementById('overallStatus');
   if (!el) return;
@@ -622,15 +634,19 @@ function renderChannelStatus(data) {
     const ctrlBadge = ctrlKnown
       ? `<span class="cs-badge2" style="background:${enabled ? 'rgba(16,185,129,.13)' : 'rgba(127,127,127,.14)'};color:${enabled ? 'var(--accent2)' : 'var(--text2)'}">${enabled ? '已启用' : '已暂停'}</span>`
       : '';
+    const upstreamUrl = normalizeHttpUrl((lastControlChannels[id] || {}).base_url || ch.upstream_url || ch.bal_url || '');
+    const openUpstreamBtn = upstreamUrl
+      ? `<a class="btn btn-sm btn-ghost cs-open-upstream" href="${escapeAttr(upstreamUrl)}" target="_blank" rel="noopener noreferrer" title="在新标签页打开上游地址">打开上游</a>`
+      : '';
     const ctrlBtns = controlConfigured
-      ? `<div style="display:flex;gap:8px;margin-top:10px">
+      ? `<div class="cs-ctrl">
+           ${openUpstreamBtn}
            <button class="btn btn-sm" style="${enabled ? 'opacity:.45;pointer-events:none' : ''}" onclick="toggleChannelStatus(${id}, true, this)">启动</button>
            <button class="btn btn-sm btn-ghost" style="${!enabled ? 'opacity:.45;pointer-events:none' : ''}" onclick="toggleChannelStatus(${id}, false, this)">暂停</button>
          </div>`
-      : '';
-    let balHtml = '';
+      : `<div class="cs-ctrl${openUpstreamBtn ? '' : ' cs-ctrl-empty'}">${openUpstreamBtn}</div>`;
+    let balInner;
     if (bal.configured) {
-      let balInner;
       if (bal.error) {
         balInner = `<span style="color:var(--accent4)" title="${escapeAttr(bal.error)}">查询失败</span>`;
       } else if (bal.value !== null && bal.value !== undefined) {
@@ -638,14 +654,19 @@ function renderChannelStatus(data) {
       } else {
         balInner = '<span style="color:var(--text2)">待刷新</span>';
       }
-      balHtml = `
-      <div class="cs-avail" style="border-top:1px dashed var(--border);margin-top:10px;padding-top:10px">
-        <span class="al">账号余额 · ${bal.type}${bal.checked_at ? ' · ' + bal.checked_at.slice(5, 16) : ''}</span>
-        <span style="display:flex;align-items:center;gap:8px">${balInner}
-          <button class="icon-btn" style="width:26px;height:26px;font-size:12px" title="刷新余额" onclick="refreshCardBalance(${id}, this)">↻</button>
-        </span>
-      </div>`;
+    } else {
+      balInner = '<span style="color:var(--text2)">未配置</span>';
     }
+    // 余额区块始终占位，避免有/无余额配置导致卡片高度错位
+    const balHtml = `
+      <div class="cs-bal${bal.configured ? '' : ' cs-bal-empty'}">
+        <span class="al">${bal.configured
+          ? `账号余额 · ${escapeHtml(bal.type || '')}${bal.checked_at ? ' · ' + bal.checked_at.slice(5, 16) : ''}`
+          : '账号余额 · 未配置'}</span>
+        <span class="cs-bal-val">${balInner}${bal.configured
+          ? ` <button class="icon-btn" style="width:26px;height:26px;font-size:12px" title="刷新余额" onclick="refreshCardBalance(${id}, this)">↻</button>`
+          : ''}</span>
+      </div>`;
     const card = document.createElement('div');
     card.className = 'cs-card';
     card.draggable = true;
@@ -653,9 +674,11 @@ function renderChannelStatus(data) {
     card.innerHTML = `
       <div class="cs-top">
         <span class="cs-ic" style="background:${st.bg};color:${st.c}">${st.glyph}</span>
-        <span class="cs-title">${escapeHtml(ch.name || '渠道 ' + id)}</span>
-        <span class="cs-badge2" style="background:${st.bg};color:${st.c}">${st.txt}</span>
-        ${ctrlBadge}
+        <span class="cs-title" title="${escapeAttr(ch.name || '渠道 ' + id)}">${escapeHtml(ch.name || '渠道 ' + id)}</span>
+        <span class="cs-badges">
+          <span class="cs-badge2" style="background:${st.bg};color:${st.c}">${st.txt}</span>
+          ${ctrlBadge}
+        </span>
       </div>
       <div class="cs-tags">
         <span class="cs-tag" style="color:${palette}">#${id}</span>
@@ -689,9 +712,11 @@ function renderChannelStatus(data) {
       </div>
       ${balHtml}
       ${ctrlBtns}
-      <div class="cs-striprow"><span>近 60 分钟</span><span>${refreshLbl}</span></div>
-      <div class="cs-bars">${barsHtml}</div>
-      <div class="cs-foot"><span>PAST</span><span>NOW</span></div>`;
+      <div class="cs-bottom">
+        <div class="cs-striprow"><span>近 60 分钟</span><span>${refreshLbl}</span></div>
+        <div class="cs-bars">${barsHtml}</div>
+        <div class="cs-foot"><span>PAST</span><span>NOW</span></div>
+      </div>`;
     grid.appendChild(card);
   });
   wrap.innerHTML = '';
@@ -752,6 +777,11 @@ async function loadChannels() {
       <td>${ch.id}</td>
       <td><input class="name-input" value="${escapeAttr(ch.name)}" onchange="updateChannel(${ch.id}, 'name', this.value)"></td>
       <td><input class="rate-input" type="number" step="0.001" value="${ch.rate}" onchange="updateChannel(${ch.id}, 'rate', this.value)"></td>
+      <td>
+        <div class="rate-meta">${ch.upstream_rate === null || ch.upstream_rate === undefined ? '—' : ('×' + Number(ch.upstream_rate).toFixed(4).replace(/0+$/,'').replace(/\.$/,''))}</div>
+        <div class="rate-src" title="${escapeAttr(ch.upstream_rate_source || '')}">${escapeHtml(ch.upstream_rate_source || '')}</div>
+      </td>
+      <td><input class="rate-input" type="number" step="0.001" value="${ch.upstream_rate_factor ?? 1}" onchange="updateChannel(${ch.id}, 'upstream_rate_factor', this.value)"></td>
       <td>${balCell}</td>
       <td style="color:var(--text2)">${ch.updated_at || ''}</td>
       <td style="white-space:nowrap">
@@ -875,10 +905,30 @@ async function loadRateHistory() {
 
 async function updateChannel(id, field, value) {
   const body = {};
-  body[field] = field === 'rate' ? parseFloat(value) : value;
+  body[field] = (field === 'rate' || field === 'upstream_rate_factor') ? parseFloat(value) : value;
   await apiFetch('/api/channels/' + id, {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
   toast('已更新');
   loadChannels();
+}
+
+async function loadRateAutoSettings() {
+  try {
+    const d = await (await apiFetch('/api/settings/rate-auto')).json();
+    const el = document.getElementById('rateAutoTarget');
+    if (el) el.value = d.target_rate;
+    const hint = document.getElementById('rateAutoHint');
+    if (hint) hint.textContent = `最终系数 = ${d.target_rate} − 上游倍率 × 折算`;
+  } catch(e) { console.error('Rate auto settings error:', e); }
+}
+async function saveRateAutoTarget() {
+  const target = parseFloat(document.getElementById('rateAutoTarget').value);
+  if (Number.isNaN(target) || target < 0) { toast('请输入有效全局系数'); return; }
+  try {
+    const r = await (await apiFetch('/api/settings/rate-auto', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({target_rate: target})})).json();
+    toast(`全局系数已保存，重算 ${r.updated || 0} 个渠道`);
+    loadRateAutoSettings();
+    loadChannels();
+  } catch(e) { toast('保存失败'); }
 }
 
 async function deleteChannel(id) {
@@ -908,7 +958,8 @@ async function syncChannels() {
   btn.disabled = true; btn.textContent = '同步中…';
   try {
     const r = await (await apiFetch('/api/channels/sync', {method:'POST'})).json();
-    toast(`同步完成：新增 ${r.added || 0}，改名 ${r.renamed || 0}，共 ${r.total || 0} 个`);
+    const errCount = r.upstream_errors ? Object.keys(r.upstream_errors).length : 0;
+    toast(`同步完成：新增 ${r.added || 0}，改名 ${r.renamed || 0}，删除 ${r.deleted || 0}，倍率更新 ${r.rate_updated || 0}，匹配 ${r.upstream_matched || 0}，共 ${r.total || 0} 个${errCount ? '（' + errCount + ' 个倍率未匹配）' : ''}`);
   } catch (e) {
     toast('同步失败：' + (e.message || e));
   } finally {
@@ -1076,6 +1127,7 @@ async function loadSettings() {
     renderCurl();
     loadWebhook();
     loadControl();
+    loadRateAutoSettings();
   } catch(e) { console.error(e); }
 }
 async function loadControl() {
