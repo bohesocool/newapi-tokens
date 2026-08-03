@@ -578,12 +578,11 @@ function renderChannelStatus(data) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">数据库查询失败，暂无渠道状态</div>';
     return;
   }
-  // 排序：先按 localStorage 保存的自定义顺序，未保存的新渠道按 ID 升序追加到末尾
+  // 排序：固定按“当前分钟有调用/无调用 + 是否 -mini”分组；
+  // 同组内保留 localStorage 保存的自定义顺序，未保存的新渠道按 ID 追加。
   const allIds = Object.keys(data.channels);
   const saved = getCsOrder();
-  const ids = [];
-  saved.forEach(id => { if (allIds.indexOf(id) !== -1) ids.push(id); });
-  allIds.filter(id => saved.indexOf(id) === -1).sort((a, b) => a - b).forEach(id => ids.push(id));
+  const ids = sortChannelIds(allIds, data.channels, saved);
   if (!ids.length) {
     wrap.innerHTML = '<div style="color:var(--text2);font-size:13px">暂无渠道</div>';
     return;

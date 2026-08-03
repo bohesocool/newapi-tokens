@@ -18,10 +18,12 @@ from psycopg_pool import ConnectionPool
 
 try:
     from .cache_utils import TTLResponseCache
+    from .model_groups import MINI_MODEL_LIKE_PATTERNS, mini_model_sql
     from .report_text import build_daily_report_text, build_hourly_report_text
     from .scheduler_lock import sqlite_lease
 except ImportError:
     from cache_utils import TTLResponseCache
+    from model_groups import MINI_MODEL_LIKE_PATTERNS, mini_model_sql
     from report_text import build_daily_report_text, build_hourly_report_text
     from scheduler_lock import sqlite_lease
 
@@ -41,6 +43,7 @@ PG_DB = os.environ.get("PG_DB", "new-api")
 PG_PASSWORD = os.environ.get("PG_PASSWORD", "")
 TOKEN_NAME = os.environ.get("TOKEN_NAME", "ducker")
 QUOTA_PER_USD = 500000
+MINI_MODEL_CONDITION = mini_model_sql("model_name")
 
 PG_CONNINFO = (
     f"host={PG_HOST} port={PG_PORT} user={PG_USER} dbname={PG_DB} "
@@ -402,12 +405,12 @@ ORDER BY channel_id, m"""
 
 def query_pg_minute_model_status(start_ts, end_ts):
     """Per-minute success/error counts split into mini/non-mini model groups."""
-    sql = """
+    sql = f"""
 SELECT
   created_at / 60 AS m,
   CASE
-    WHEN model_name ILIKE %s THEN 'mini'
-    WHEN model_name NOT ILIKE %s THEN 'other'
+    WHEN {MINI_MODEL_CONDITION} THEN 'mini'
+    WHEN NOT {MINI_MODEL_CONDITION} THEN 'other'
     ELSE NULL
   END AS model_group,
   count(*) FILTER (WHERE type = 2),
@@ -419,7 +422,8 @@ WHERE type IN (2, 5)
   AND created_at < %s
 GROUP BY m, model_group
 ORDER BY m, model_group"""
-    rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
+    rows = _pg_rows(sql, (*MINI_MODEL_LIKE_PATTERNS, *MINI_MODEL_LIKE_PATTERNS,
+                          TOKEN_NAME, int(start_ts), int(end_ts)))
     if rows is None:
         return None
     out = {"mini": {}, "other": {}}
@@ -435,19 +439,20 @@ ORDER BY m, model_group"""
 def query_pg_rpm_detail(start_ts, end_ts):
     """Trailing-window request counts per channel plus mini/non-mini totals.
     Keeps the RPM cards to one indexed Postgres range scan instead of two."""
-    sql = """
+    sql = f"""
 SELECT
   channel_id,
   count(*),
-  count(*) FILTER (WHERE model_name ILIKE %s),
-  count(*) FILTER (WHERE model_name NOT ILIKE %s)
+  count(*) FILTER (WHERE {MINI_MODEL_CONDITION}),
+  count(*) FILTER (WHERE NOT {MINI_MODEL_CONDITION})
 FROM logs
 WHERE type IN (2, 5)
   AND token_name = %s
   AND created_at >= %s
   AND created_at < %s
 GROUP BY channel_id"""
-    rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
+    rows = _pg_rows(sql, (*MINI_MODEL_LIKE_PATTERNS, *MINI_MODEL_LIKE_PATTERNS,
+                          TOKEN_NAME, int(start_ts), int(end_ts)))
     if rows is None:
         return None
     rpm_map = {}
@@ -472,12 +477,12 @@ def query_pg_avg_latency(start_ts, end_ts):
     used to fetch separately. Returns a tuple:
       ({channel_id: {"dur", "frt"}}, {"model_group": {"dur", "frt"}})
     or (None, None) on failure."""
-    sql = """
+    sql = f"""
 SELECT
   channel_id,
   CASE
-    WHEN model_name ILIKE %s THEN 'mini'
-    WHEN model_name NOT ILIKE %s THEN 'other'
+    WHEN {MINI_MODEL_CONDITION} THEN 'mini'
+    WHEN NOT {MINI_MODEL_CONDITION} THEN 'other'
     ELSE NULL
   END AS model_group,
   AVG(use_time),
@@ -489,7 +494,8 @@ WHERE type = 2
   AND created_at < %s
 GROUP BY channel_id, model_group
 ORDER BY channel_id"""
-    rows = _pg_rows(sql, ('%-mini%', '%-mini%', TOKEN_NAME, int(start_ts), int(end_ts)))
+    rows = _pg_rows(sql, (*MINI_MODEL_LIKE_PATTERNS, *MINI_MODEL_LIKE_PATTERNS,
+                          TOKEN_NAME, int(start_ts), int(end_ts)))
     if rows is None:
         return None, None
     by_ch = {}
@@ -622,12 +628,17 @@ def _match_upstream_key(channel_info, key_items):
     match by local channel name containing the upstream key name or group name tokens
     (e.g. “麻豆plus特惠” -> key “特惠”, “兜底-mini” -> group/key “兜底”).
     """
+    cname = _norm_match_text(channel_info.get("name") or "")
+    # An empty name is not evidence for any key. In particular, ``cname in n``
+    # would otherwise be true for every candidate because every string contains
+    # the empty string, causing the first key to win by accident.
+    if not cname:
+        return None
     priced = [k for k in key_items if k.get("rate") is not None and (k.get("status") in (None, "active"))]
     if not priced:
         return None
     if len(priced) == 1:
         return priced[0]
-    cname = _norm_match_text(channel_info.get("name") or "")
     best = None
     best_score = 0
     strong_tokens = ("稳定", "特惠", "兜底", "mini", "team")
@@ -652,6 +663,56 @@ def _match_upstream_key(channel_info, key_items):
             best = item
             best_score = score
     return best if best_score > 0 else None
+
+
+def _select_local_credential_group(remote_url, remote_ids, local_groups):
+    """Choose local credentials for a group of remote channels.
+
+    The new-api channel ``base_url`` is authoritative for which upstream keys to
+    query, but a hostname can change (for example ``mdkj.lol`` ->
+    ``vip.mdkj.lol``) before the monitor's local ``bal_url`` is updated. Reuse
+    credentials from a local group that contains one or more of the same channel
+    IDs, preferring an exact URL group and then the group with the most overlap.
+
+    Returns ``{"representative": row, "query_url": remote_url, ...}`` or None.
+    """
+    query_url = (remote_url or "").strip().rstrip("/")
+    ids = {str(cid) for cid in (remote_ids or set())}
+    if not query_url or not ids:
+        return None
+
+    candidates = []
+    for local_url, members in (local_groups or {}).items():
+        overlap = ids.intersection(str(m.get("id")) for m in members)
+        if not overlap:
+            continue
+        credentialed = [
+            m for m in members
+            if (m.get("bal_type") or "").strip() == "sub2api"
+            and ((m.get("bal_account") or "").strip()
+                 or (m.get("bal_password") or "").strip()
+                 or (m.get("bal_rt") or "").strip())
+        ]
+        if not credentialed:
+            continue
+        local_norm = (local_url or "").strip().rstrip("/")
+        candidates.append({
+            "representative": credentialed[0],
+            "query_url": query_url,
+            "local_url": local_norm,
+            "overlap": overlap,
+            "exact_url": local_norm == query_url,
+        })
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (
+        item["exact_url"],
+        len(item["overlap"]),
+        # Stable deterministic tie-breaker; do not depend on DB row order.
+        item["local_url"],
+    ), reverse=True)
+    return candidates[0]
 
 
 def _fetch_sub2api_key_rates(cfg):
@@ -720,19 +781,23 @@ def fetch_upstream_rates_for_channels(remote_channels):
     """
     result = {}
     errors = {}
-    groups = _balance_url_groups()
     remote_by_url = {}
     for cid_str, info in (remote_channels or {}).items():
         norm = (info.get("base_url") or "").strip().rstrip("/")
         if norm:
             remote_by_url.setdefault(norm, {})[str(cid_str)] = info
-    for norm_url, members in groups.items():
-        if not members:
+    local_groups = _balance_url_groups()
+    for norm_url, target_infos in remote_by_url.items():
+        selected = _select_local_credential_group(
+            norm_url, set(target_infos), local_groups
+        )
+        if not selected:
+            errors[norm_url] = "未找到可复用的 sub2api 凭据"
             continue
-        rep = dict(members[0])
-        if (rep.get("bal_type") or "").strip() != "sub2api":
-            errors[norm_url] = "仅 sub2api 上游支持自动倍率"
-            continue
+        rep = dict(selected["representative"])
+        # Query the authoritative remote URL even when the local bal_url is stale;
+        # credentials are reused from the overlapping local group above.
+        rep["bal_url"] = norm_url
         key_items, new_rt, err = _fetch_sub2api_key_rates(rep)
         if new_rt and new_rt != (rep.get("bal_rt") or ""):
             with get_db() as conn:
@@ -741,19 +806,11 @@ def fetch_upstream_rates_for_channels(remote_channels):
         if err:
             errors[norm_url] = err
             continue
-        local_by_id = {str(m["id"]): dict(m) for m in members}
-        target_infos = dict(remote_by_url.get(norm_url, {}))
-        # If a local row has no corresponding remote channel (should be rare), still
-        # allow matching by its local name so stale/manual rows don't break the group.
-        for cid_str, m in local_by_id.items():
-            target_infos.setdefault(cid_str, {"name": m.get("name") or "", "base_url": norm_url})
         for cid_str, ch_info in target_infos.items():
             try:
                 cid = int(cid_str)
             except (TypeError, ValueError):
                 continue
-            if not ch_info.get("name") and cid_str in local_by_id:
-                ch_info = {**ch_info, "name": local_by_id[cid_str].get("name") or ""}
             match = _match_upstream_key(ch_info, key_items or [])
             if not match:
                 errors[str(cid)] = f"未匹配到上游 key（{norm_url}）"
