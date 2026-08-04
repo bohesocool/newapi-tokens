@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # newapi-tokens 一键启动脚本
 # 自动探测 NewAPI 的 PostgreSQL 连接信息，生成 .env，构建并启动 Docker 容器
-set -euo pipefail
+set -uo pipefail
+# 注意：不开 set -e，因为 docker exec psql 失败时会杀掉脚本
+# 关键错误用手动 exit 1 检查
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -244,8 +246,6 @@ fi
 
 # ── 从 NewAPI 数据库查出可用分组，交互式选择 ──
 query_groups() {
-    # 临时关闭 set -e，这个函数里任何失败都不应杀掉脚本
-    set +e
     local container=""
     if docker inspect postgres >/dev/null 2>&1; then
         container="postgres"
@@ -253,13 +253,11 @@ query_groups() {
         container="${PG_HOST}"
     fi
     if [[ -z "$container" ]]; then
-        echo ""
         return
     fi
     docker exec -e PGPASSWORD="${PG_PASSWORD}" "$container" \
         psql -U "${PG_USER:-root}" -d "${PG_DB:-new-api}" -t -A -c \
         "SELECT DISTINCT \"group\" FROM tokens WHERE \"group\" IS NOT NULL AND \"group\" <> '' ORDER BY 1;" 2>/dev/null
-    set -e
 }
 
 if [[ -t 0 ]]; then
