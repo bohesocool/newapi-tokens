@@ -510,6 +510,28 @@ def query_pg_model_avg_latency(start_ts, end_ts):
     _, by_model = query_pg_avg_latency(start_ts, end_ts)
     return by_model
 
+def query_pg_avg_latency_total(start_ts, end_ts):
+    """Overall average request duration (seconds) and first-response time (ms) across
+    ALL channels — a true mean over every successful (type=2) log, not a mean of
+    per-channel means. Returns {"dur": float|None, "frt": float|None} or None on failure."""
+    sql = """
+SELECT
+  AVG(use_time),
+  AVG(NULLIF(substring(other::text FROM '"frt"[[:space:]]*:[[:space:]]*([-0-9.]+)'), '')::float8)
+FROM logs
+WHERE type = 2
+  AND "group" = %s
+  AND created_at >= %s
+  AND created_at < %s"""
+    rows = _pg_rows(sql, (TRACK_GROUP, int(start_ts), int(end_ts)))
+    if rows is None:
+        return None
+    r = rows[0] if rows else (None, None)
+    return {
+        "dur": float(r[0]) if r[0] is not None else None,
+        "frt": float(r[1]) if r[1] is not None else None,
+    }
+
 def now_shanghai():
     return datetime.now(SHANGHAI)
 
@@ -1668,6 +1690,186 @@ def _compute_channel_status(minutes):
                           "avg_frt": (model_latency.get("other") or {}).get("frt")},
             },
             "error": False}
+
+@app.get("/api/status", dependencies=[Depends(require_auth)])
+def api_status(period: str = "min"):
+    """Aggregate channel usage report for the last completed minute / hour / day.
+
+    ``period``:
+      * ``min``  — previous completed 60-second minute (no cost data)
+      * ``hour`` — previous completed clock hour, e.g. 10:00→10:59 (with real cost)
+      * ``day``  — previous full calendar day, 00:00→23:59 (with real cost)
+
+    For each channel returns: calls, errors, success_count, success_rate,
+    avg_duration (seconds), avg_frt (ms). The ``total`` block adds success_count,
+    success_rate, avg_duration, avg_frt and (for hour/day) total_real / total_usd.
+
+    Authentication is the same API-key / browser-session auth used by every other
+    data endpoint (``require_auth``). Results are cached for 30 s so concurrent
+    polls share one PG round-trip.
+    """
+    period = (period or "").strip().lower()
+    if period not in ("min", "hour", "day"):
+        raise HTTPException(400, "period must be one of: min, hour, day")
+    return cached_response(f"status:{period}", 30, lambda: _compute_status(period))
+
+def _compute_status(period):
+    now = now_shanghai()
+    if period == "min":
+        start = now.replace(second=0, microsecond=0) - timedelta(minutes=1)
+        end = start + timedelta(minutes=1)
+    elif period == "hour":
+        start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        end = start + timedelta(hours=1)
+    else:  # day
+        start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+
+    start_ts = int(start.timestamp())
+    end_ts = int(end.timestamp())
+
+    # Per-channel success/error counts (one indexed range scan)
+    err_map = query_pg_error_rates(start_ts, end_ts)
+    # Per-channel avg duration + first-response time
+    latency_map, _model_latency = query_pg_avg_latency(start_ts, end_ts)
+    # Overall average latency across all channels (true mean, not mean-of-means)
+    total_latency = query_pg_avg_latency_total(start_ts, end_ts)
+
+    pg_error = err_map is None
+    err_map = err_map or {}
+    latency_map = latency_map or {}
+    total_latency = total_latency or {}
+
+    rates = get_rates()
+
+    # ── per-channel assembly ──
+    all_ids = sorted(set(rates.keys()) | set(err_map.keys()))
+    channels = {}
+    total_calls = 0
+    total_errors = 0
+    total_success = 0
+    for ch_id in all_ids:
+        d = err_map.get(ch_id, {})
+        calls = d.get("success", 0)
+        errors = d.get("errors", 0)
+        total = calls + errors
+        success_rate = (calls / total) if total > 0 else None
+        lat = latency_map.get(ch_id, {})
+        channels[str(ch_id)] = {
+            "name": rates.get(ch_id, {}).get("name", ""),
+            "calls": calls,
+            "errors": errors,
+            "total": total,
+            "success_rate": success_rate,
+            "avg_duration": lat.get("dur"),
+            "avg_frt": lat.get("frt"),
+        }
+        total_calls += calls
+        total_errors += errors
+        total_success += calls
+
+    total_requests = total_calls + total_errors
+    total_success_rate = (total_calls / total_requests) if total_requests > 0 else None
+
+    result = {
+        "period": period,
+        "start": start.strftime("%Y-%m-%d %H:%M:%S"),
+        "end": end.strftime("%Y-%m-%d %H:%M:%S"),
+        "group": TRACK_GROUP,
+        "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "channels": channels,
+        "total": {
+            "calls": total_calls,
+            "errors": total_errors,
+            "total_requests": total_requests,
+            "success_count": total_success,
+            "success_rate": total_success_rate,
+            "avg_duration": total_latency.get("dur"),
+            "avg_frt": total_latency.get("frt"),
+        },
+        "error": "数据库查询失败，数据可能不完整" if pg_error else None,
+    }
+
+    # ── cost data for hour / day (min has no cost) ──
+    if period in ("hour", "day"):
+        total_real = 0.0
+        total_usd = 0.0
+        if period == "hour":
+            f = SNAPSHOT_DIR / f"{start.strftime('%Y-%m-%d')}_{start.hour:02d}.json"
+            if f.exists():
+                snap = json.loads(f.read_text(encoding="utf-8"))
+                total_real = snap.get("total_real", 0)
+                total_usd = snap.get("total_usd", 0)
+                # Merge snapshot calls/usd/real_cost/errors into channels
+                for cid_str, ch in snap.get("channels", {}).items():
+                    entry = channels.setdefault(cid_str, {
+                        "name": rates.get(int(cid_str), {}).get("name", ""),
+                        "calls": 0, "errors": 0, "total": 0,
+                        "success_rate": None, "avg_duration": None, "avg_frt": None,
+                    })
+                    entry["calls"] = ch.get("calls", 0)
+                    entry["errors"] = ch.get("errors", 0)
+                    entry["total"] = entry["calls"] + entry["errors"]
+                    entry["success_rate"] = (
+                        entry["calls"] / entry["total"] if entry["total"] > 0 else None
+                    )
+                    entry["usd"] = ch.get("usd", 0)
+                    entry["real_cost"] = ch.get("real_cost", 0)
+                # Recompute totals from snapshot
+                total_calls = snap.get("total_calls", 0)
+                total_errors = snap.get("total_errors", 0)
+                total_requests = total_calls + total_errors
+                result["total"]["calls"] = total_calls
+                result["total"]["errors"] = total_errors
+                result["total"]["total_requests"] = total_requests
+                result["total"]["success_rate"] = (
+                    total_calls / total_requests if total_requests > 0 else None
+                )
+            else:
+                result["error"] = (result.get("error") or "") + " 小时快照不存在，无消费数据"
+        else:  # day
+            ch_data, total_real, total_usd, total_calls, missing = \
+                load_snapshots(start, end)
+            if not ch_data:
+                with get_db() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM daily_history WHERE date = ?",
+                        (start.strftime("%Y-%m-%d"),),
+                    ).fetchone()
+                if row:
+                    ch_data = json.loads(row["channels_json"]) if row["channels_json"] else {}
+                    total_real = row["total_real"]
+                    total_usd = row["total_usd"]
+                    total_calls = row["total_calls"]
+            if ch_data:
+                for cid_str, ch in ch_data.items():
+                    entry = channels.setdefault(cid_str, {
+                        "name": rates.get(int(cid_str), {}).get("name", ""),
+                        "calls": 0, "errors": 0, "total": 0,
+                        "success_rate": None, "avg_duration": None, "avg_frt": None,
+                    })
+                    entry["calls"] = ch.get("calls", 0)
+                    entry["errors"] = ch.get("errors", 0)
+                    entry["total"] = entry["calls"] + entry["errors"]
+                    entry["success_rate"] = (
+                        entry["calls"] / entry["total"] if entry["total"] > 0 else None
+                    )
+                    entry["usd"] = ch.get("usd", 0)
+                    entry["real_cost"] = ch.get("real_cost", 0)
+                # Recompute totals from merged snapshot/day data
+                total_calls = sum(c.get("calls", 0) for c in ch_data.values())
+                total_errors = sum(c.get("errors", 0) for c in ch_data.values())
+                total_requests = total_calls + total_errors
+                result["total"]["calls"] = total_calls
+                result["total"]["errors"] = total_errors
+                result["total"]["total_requests"] = total_requests
+                result["total"]["success_rate"] = (
+                    total_calls / total_requests if total_requests > 0 else None
+                )
+        result["total"]["total_real"] = round(total_real, 4)
+        result["total"]["total_usd"] = round(total_usd, 4)
+
+    return result
 
 @app.post("/api/snapshot/hourly", dependencies=[Depends(require_auth)])
 def api_snapshot_hourly():
