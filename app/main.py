@@ -41,7 +41,7 @@ PG_PORT = os.environ.get("PG_PORT", "5432")
 PG_USER = os.environ.get("PG_USER", "root")
 PG_DB = os.environ.get("PG_DB", "new-api")
 PG_PASSWORD = os.environ.get("PG_PASSWORD", "")
-TOKEN_NAME = os.environ.get("TOKEN_NAME", "ducker")
+TRACK_GROUP = os.environ.get("TRACK_GROUP", "default")
 QUOTA_PER_USD = 500000
 MINI_MODEL_CONDITION = mini_model_sql("model_name")
 
@@ -174,19 +174,6 @@ def init_db():
         if "upstream_rate_factor" not in channel_cols:
             conn.execute("UPDATE channels SET upstream_rate_factor = 0.1 WHERE id = 26")
             conn.commit()
-        # Seed default channels if empty
-        row = conn.execute("SELECT count(*) FROM channels").fetchone()
-        if row[0] == 0:
-            defaults = [
-                (1, "刀015", 0.01),
-                (2, "冰0095", 0.04),
-                (3, "kedaya010", 0.03),
-                (4, "madou012", 0.06),
-                (5, "madou0065", 0.1),
-            ]
-            conn.executemany("INSERT INTO channels (id, name, rate) VALUES (?,?,?)", defaults)
-            conn.commit()
-
 init_db()
 
 # ── Settings (key-value) ──
@@ -317,9 +304,9 @@ def fmt_num(n):
     return str(n)
 
 def query_pg(start_ts, end_ts):
-    """Per-channel success(type=2) aggregates plus error(type=5) count for the token in
+    """Per-channel success(type=2) aggregates plus error(type=5) count for the group in
     [start, end). Read-only single query — uses idx_created_at_type. Returns rows or None.
-    token_name/start/end are passed as real query parameters (no string interpolation)."""
+    "group"/start/end are passed as real query parameters (no string interpolation)."""
     sql = """
 SELECT
   channel_id,
@@ -331,12 +318,12 @@ SELECT
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = %s
+  AND "group" = %s
   AND created_at >= %s
   AND created_at < %s
 GROUP BY channel_id
 ORDER BY channel_id"""
-    return _pg_rows(sql, (QUOTA_PER_USD, TOKEN_NAME, int(start_ts), int(end_ts)))
+    return _pg_rows(sql, (QUOTA_PER_USD, TRACK_GROUP, int(start_ts), int(end_ts)))
 
 def parse_pg_rows(rows):
     """Parse query_pg result rows into a channel dict."""
@@ -356,7 +343,7 @@ def parse_pg_rows(rows):
     return channels
 
 def query_pg_error_rates(start_ts, end_ts):
-    """Per-channel success(type=2)/error(type=5) counts for the token in [start, end).
+    """Per-channel success(type=2)/error(type=5) counts for the group in [start, end).
     Read-only single aggregated query — uses idx_created_at_type. Returns dict or None."""
     sql = """
 SELECT
@@ -365,18 +352,18 @@ SELECT
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = %s
+  AND "group" = %s
   AND created_at >= %s
   AND created_at < %s
 GROUP BY channel_id
 ORDER BY channel_id"""
-    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    rows = _pg_rows(sql, (TRACK_GROUP, int(start_ts), int(end_ts)))
     if rows is None:
         return None
     return {int(r[0]): {"success": int(r[1]), "errors": int(r[2])} for r in rows}
 
 def query_pg_minute_status(start_ts, end_ts):
-    """Per-channel, per-minute success(type=2)/error(type=5) counts for the token in
+    """Per-channel, per-minute success(type=2)/error(type=5) counts for the group in
     [start, end). Groups by channel_id and the minute bucket (created_at/60), so a single
     indexed read-only query yields one row per (channel, minute). Returns dict or None:
         {channel_id: {minute_bucket: {"success": n, "errors": n}}}"""
@@ -388,12 +375,12 @@ SELECT
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = %s
+  AND "group" = %s
   AND created_at >= %s
   AND created_at < %s
 GROUP BY channel_id, m
 ORDER BY channel_id, m"""
-    rows = _pg_rows(sql, (TOKEN_NAME, int(start_ts), int(end_ts)))
+    rows = _pg_rows(sql, (TRACK_GROUP, int(start_ts), int(end_ts)))
     if rows is None:
         return None
     out = {}
@@ -417,13 +404,13 @@ SELECT
   count(*) FILTER (WHERE type = 5)
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = %s
+  AND "group" = %s
   AND created_at >= %s
   AND created_at < %s
 GROUP BY m, model_group
 ORDER BY m, model_group"""
     rows = _pg_rows(sql, (*MINI_MODEL_LIKE_PATTERNS, *MINI_MODEL_LIKE_PATTERNS,
-                          TOKEN_NAME, int(start_ts), int(end_ts)))
+                          TRACK_GROUP, int(start_ts), int(end_ts)))
     if rows is None:
         return None
     out = {"mini": {}, "other": {}}
@@ -447,12 +434,12 @@ SELECT
   count(*) FILTER (WHERE NOT {MINI_MODEL_CONDITION})
 FROM logs
 WHERE type IN (2, 5)
-  AND token_name = %s
+  AND "group" = %s
   AND created_at >= %s
   AND created_at < %s
 GROUP BY channel_id"""
     rows = _pg_rows(sql, (*MINI_MODEL_LIKE_PATTERNS, *MINI_MODEL_LIKE_PATTERNS,
-                          TOKEN_NAME, int(start_ts), int(end_ts)))
+                          TRACK_GROUP, int(start_ts), int(end_ts)))
     if rows is None:
         return None
     rpm_map = {}
@@ -489,13 +476,13 @@ SELECT
   AVG(NULLIF(substring(other::text FROM '"frt"[[:space:]]*:[[:space:]]*([-0-9.]+)'), '')::float8)
 FROM logs
 WHERE type = 2
-  AND token_name = %s
+  AND "group" = %s
   AND created_at >= %s
   AND created_at < %s
 GROUP BY channel_id, model_group
 ORDER BY channel_id"""
     rows = _pg_rows(sql, (*MINI_MODEL_LIKE_PATTERNS, *MINI_MODEL_LIKE_PATTERNS,
-                          TOKEN_NAME, int(start_ts), int(end_ts)))
+                          TRACK_GROUP, int(start_ts), int(end_ts)))
     if rows is None:
         return None, None
     by_ch = {}
@@ -2149,7 +2136,7 @@ def build_hourly_report(start_dt):
                 for cid, d in snap.get("channels", {}).items()}
     text = build_hourly_report_text(
         start_dt,
-        TOKEN_NAME,
+        TRACK_GROUP,
         channels,
         snap.get("total_real", 0),
         snap.get("total_usd", 0),
@@ -2177,7 +2164,7 @@ def build_daily_report(date_str):
         d["name"] = rates.get(int(cid), {}).get("name", "")
     text = build_daily_report_text(
         date_str,
-        TOKEN_NAME,
+        TRACK_GROUP,
         channels,
         total_real,
         total_usd,

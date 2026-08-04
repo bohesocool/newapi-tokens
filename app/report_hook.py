@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 SHANGHAI = timezone(timedelta(hours=8))
 MONITOR_URL = os.environ.get("MONITOR_URL", "http://localhost:9217")
 API_KEY = os.environ.get("MONITOR_API_KEY", "")
-TOKEN_NAME = os.environ.get("TOKEN_NAME", "ducker")
+TOKEN_NAME = os.environ.get("TRACK_GROUP", "default")
 
 def api_open(path, method="GET", timeout=10):
     """Open a monitor API endpoint with the API key attached."""
@@ -64,7 +64,7 @@ try:
         title = "📊 NewAPI 消费 12 小时报"
         start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=12)
         end = start + timedelta(hours=12)
-        report = f"{title}\n━━━━━━━━━━━━━━━━━\n⏰ 时段: {start.strftime('%m-%d %H:%M')} → {end.strftime('%m-%d %H:%M')}\n🔑 令牌: {TOKEN_NAME}\n📐 方式: 小时报叠加\n━━━━━━━━━━━━━━━━━"
+        report = f"{title}\n━━━━━━━━━━━━━━━━━\n⏰ 时段: {start.strftime('%m-%d %H:%M')} → {end.strftime('%m-%d %H:%M')}\n🔑 分组: {TOKEN_NAME}\n📐 方式: 小时报叠加\n━━━━━━━━━━━━━━━━━"
 
         channels = data.get("channels", {})
         total_real = data.get("today_total",{}).get("total_real",0)

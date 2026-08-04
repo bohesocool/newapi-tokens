@@ -141,11 +141,23 @@ if [[ -f .env ]]; then
     [[ -n "$EXISTING_ADMIN_PW" ]] && ADMIN_PASSWORD="$EXISTING_ADMIN_PW"
 fi
 
-# 保留现有 TOKEN_NAME
-TOKEN_NAME="ducker"
+# 保留现有 TRACK_GROUP
+TRACK_GROUP="default"
 if [[ -f .env ]]; then
-    EXISTING_TOKEN=$(grep '^TOKEN_NAME=' .env 2>/dev/null | cut -d= -f2- || true)
-    [[ -n "$EXISTING_TOKEN" ]] && TOKEN_NAME="$EXISTING_TOKEN"
+    EXISTING_GROUP=$(grep '^TRACK_GROUP=' .env 2>/dev/null | cut -d= -f2- || true)
+    [[ -n "$EXISTING_GROUP" ]] && TRACK_GROUP="$EXISTING_GROUP"
+fi
+
+# 交互式询问追踪分组（非交互模式跳过）
+if [[ -t 0 ]]; then
+    echo ""
+    info "追踪分组配置（直接回车使用默认值）"
+    read -rp "  追踪分组 [default]: " INPUT_GROUP
+    if [[ -n "$INPUT_GROUP" ]]; then
+        TRACK_GROUP="$INPUT_GROUP"
+    fi
+    log "追踪分组: $TRACK_GROUP"
+    echo ""
 fi
 
 cat > .env <<EOF
@@ -158,8 +170,8 @@ PG_USER=$PG_USER
 PG_DB=$PG_DB
 PG_PASSWORD=$PG_PASSWORD
 
-# Token to track
-TOKEN_NAME=$TOKEN_NAME
+# Group to track
+TRACK_GROUP=$TRACK_GROUP
 
 # Initial admin password (only used on first run)
 ADMIN_PASSWORD=$ADMIN_PASSWORD
@@ -217,29 +229,88 @@ echo ""
 echo "  仪表盘:    http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost'):9217"
 echo "  管理密码:  $ADMIN_PASSWORD"
 echo "  数据库:    $PG_USER@$PG_HOST:$PG_PORT/$PG_DB"
-echo "  跟踪令牌:  $TOKEN_NAME"
+echo "  追踪分组:  $TRACK_GROUP"
 echo "  Telegram: $([[ -n "$TG_BOT_TOKEN" ]] && echo '已配置' || echo '未配置')"
 echo ""
 echo "  查看日志:  docker logs -f newapi-monitor"
 echo "  停止:      cd $SCRIPT_DIR && docker compose down"
 echo ""
 
+# ── 自动同步渠道 ──
+log "自动同步渠道..."
+COOKIE_JAR=$(mktemp)
+SYNC_OK=false
+
+# 登录拿 session cookie
+LOGIN_HTTP=$(curl -s -o /dev/null -w "%{http_code}" -c "$COOKIE_JAR" \
+    -X POST http://127.0.0.1:9217/api/login \
+    -H 'Content-Type: application/json' \
+    -d "{\"password\":\"$ADMIN_PASSWORD\"}" 2>/dev/null || echo "000")
+
+if [[ "$LOGIN_HTTP" == "200" ]]; then
+    # 用 cookie 调同步
+    SYNC_HTTP=$(curl -s -o /tmp/channels_sync_resp.json -w "%{http_code}" -b "$COOKIE_JAR" \
+        -X POST http://127.0.0.1:9217/api/channels/sync 2>/dev/null || echo "000")
+
+    if [[ "$SYNC_HTTP" == "200" ]]; then
+        SYNC_OK=true
+        # 解析同步结果
+        SYNC_ADDED=$(python3 -c "import json; d=json.load(open('/tmp/channels_sync_resp.json')); print(d.get('added',0))" 2>/dev/null || echo "?")
+        SYNC_TOTAL=$(python3 -c "import json; d=json.load(open('/tmp/channels_sync_resp.json')); print(d.get('total',0))" 2>/dev/null || echo "?")
+        log "渠道同步成功 ✓  新增 $SYNC_ADDED 个，共 $SYNC_TOTAL 个渠道"
+    elif [[ "$SYNC_HTTP" == "400" ]]; then
+        warn "渠道同步失败: 未配置 NewAPI 控制凭据"
+        warn "请打开仪表盘 → 设置页面，配置 newapi_control_url / newapi_control_token / newapi_control_user"
+    else
+        warn "渠道同步失败 (HTTP $SYNC_HTTP)，请稍后在仪表盘手动同步"
+        cat /tmp/channels_sync_resp.json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('detail',''))" 2>/dev/null || true
+    fi
+
+    # 如果同步成功，拉取渠道列表打印
+    if $SYNC_OK; then
+        echo ""
+        info "已同步的渠道列表:"
+        curl -sf -b "$COOKIE_JAR" http://127.0.0.1:9217/api/channels 2>/dev/null \
+            | python3 -c "
+import sys, json
+channels = json.load(sys.stdin)
+if not channels:
+    print('  (无渠道)')
+else:
+    for ch in channels:
+        cid = ch.get('id','?')
+        name = ch.get('name','') or ''
+        rate = ch.get('rate', 0) or 0
+        print(f'  渠道 {cid:>4}  {name:<20}  倍率 {rate:.4f}')
+" 2>/dev/null || warn "无法获取渠道列表"
+        echo ""
+    fi
+else
+    warn "登录失败 (HTTP $LOGIN_HTTP)，跳过渠道同步"
+    warn "请稍后打开仪表盘手动同步渠道"
+fi
+
+rm -f "$COOKIE_JAR" /tmp/channels_sync_resp.json 2>/dev/null || true
+
 # ── 配置 webhook（如果 Telegram 已配置） ──
 if [[ -n "$TG_BOT_TOKEN" ]] && [[ -n "$TG_CHAT_ID" ]]; then
     log "配置 Telegram webhook..."
-    # 登录
-    LOGIN_RESP=$(curl -sf -X POST http://127.0.0.1:9217/api/auth/login \
+    # 登录拿 session cookie
+    COOKIE_JAR2=$(mktemp)
+    curl -s -o /dev/null -c "$COOKIE_JAR2" \
+        -X POST http://127.0.0.1:9217/api/login \
         -H 'Content-Type: application/json' \
-        -d "{\"password\":\"$ADMIN_PASSWORD\"}" 2>/dev/null || true)
-    if [[ -n "$LOGIN_RESP" ]]; then
-        # 提取 cookie
-        COOKIE=$(echo "$LOGIN_RESP" | python3 -c "import sys; print('')" 2>/dev/null || true)
+        -d "{\"password\":\"$ADMIN_PASSWORD\"}" 2>/dev/null || true
+    if [[ -s "$COOKIE_JAR2" ]]; then
         # 用 cookie 配置 webhook
         curl -sf -X POST http://127.0.0.1:9217/api/settings/webhook \
             -H 'Content-Type: application/json' \
-            -H "Cookie: pool_session=$COOKIE" \
+            -b "$COOKIE_JAR2" \
             -d '{"url":"http://newapi-tg-relay:9218/","push_hourly":true,"push_daily":true,"push_error":true}' \
             >/dev/null 2>&1 || true
         log "Telegram webhook 已配置 ✓"
+    else
+        warn "Telegram webhook 配置失败: 无法登录"
     fi
+    rm -f "$COOKIE_JAR2" 2>/dev/null || true
 fi

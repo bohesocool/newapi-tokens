@@ -15,12 +15,12 @@ def channel_report_lines(channels):
     return lines
 
 
-def build_hourly_report_text(start_dt, token_name, channels, total_real, total_usd, total_calls):
+def build_hourly_report_text(start_dt, group_name, channels, total_real, total_usd, total_calls):
     end_dt = start_dt + timedelta(hours=1)
     text = (
         "📊 NewAPI 消费小时报\n━━━━━━━━━━━━━━━━━\n"
         f"⏰ 时段: {start_dt.strftime('%m-%d %H:%M')} → {end_dt.strftime('%m-%d %H:%M')}\n"
-        f"🔑 令牌: {token_name}\n━━━━━━━━━━━━━━━━━"
+        f"🔑 分组: {group_name}\n━━━━━━━━━━━━━━━━━"
     )
     text += channel_report_lines(channels)
     text += "\n\n━━━━━━━━━━━━━━━━━\n"
@@ -31,10 +31,10 @@ def build_hourly_report_text(start_dt, token_name, channels, total_real, total_u
     return text
 
 
-def build_daily_report_text(date_str, token_name, channels, total_real, total_usd, total_calls, missing=None):
+def build_daily_report_text(date_str, group_name, channels, total_real, total_usd, total_calls, missing=None):
     text = (
         "📊 NewAPI 消费日报\n━━━━━━━━━━━━━━━━━\n"
-        f"⏰ 日期: {date_str}\n🔑 令牌: {token_name}\n📐 方式: 小时报叠加\n━━━━━━━━━━━━━━━━━"
+        f"⏰ 日期: {date_str}\n🔑 分组: {group_name}\n📐 方式: 小时报叠加\n━━━━━━━━━━━━━━━━━"
     )
     text += channel_report_lines(channels)
     text += "\n\n━━━━━━━━━━━━━━━━━\n"
