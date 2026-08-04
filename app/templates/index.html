@@ -163,7 +163,7 @@
       <div style="margin-bottom:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <span style="color:var(--text2);font-size:12px">全局系数</span>
         <input id="rateAutoTarget" class="rate-input" type="number" step="0.001" style="width:90px" onchange="saveRateAutoTarget()">
-        <span id="rateAutoHint" style="color:var(--text2);font-size:12px">最终系数 = 全局系数 − 上游倍率 × 折算</span>
+        <span id="rateAutoHint" style="color:var(--text2);font-size:12px">最终系数 = (全局系数 − 上游倍率 × 折算) × 系数</span>
       </div>
       <table id="channelsTable">
         <thead>

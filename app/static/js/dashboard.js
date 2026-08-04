@@ -916,7 +916,7 @@ async function loadRateAutoSettings() {
     const el = document.getElementById('rateAutoTarget');
     if (el) el.value = d.target_rate;
     const hint = document.getElementById('rateAutoHint');
-    if (hint) hint.textContent = `最终系数 = ${d.target_rate} − 上游倍率 × 折算`;
+    if (hint) hint.textContent = `最终系数 = (${d.target_rate} − 上游倍率 × 折算) × 系数`;
   } catch(e) { console.error('Rate auto settings error:', e); }
 }
 async function saveRateAutoTarget() {

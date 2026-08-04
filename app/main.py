@@ -159,7 +159,8 @@ def init_db():
             ("bal_value", "REAL"),
             ("bal_checked_at", "TEXT DEFAULT ''"),
             ("bal_error", "TEXT DEFAULT ''"),
-            # 上游倍率自动同步：rate = 全局系数 - upstream_rate * upstream_rate_factor
+            # 上游倍率自动同步：rate = (全局系数 - upstream_rate * upstream_rate_factor)
+            # 最终实付 = usd × rate，rate 即最终系数
             ("upstream_rate", "REAL"),
             ("upstream_rate_factor", "REAL NOT NULL DEFAULT 1"),
             ("upstream_rate_source", "TEXT DEFAULT ''"),
@@ -172,7 +173,7 @@ def init_db():
         # 渠道 26 的上游倍率是 Plus 池整体倍率，实际成本需要再 ×0.1。
         # 只在首次增加该列时初始化，避免覆盖之后你手动改过的折算。
         if "upstream_rate_factor" not in channel_cols:
-            conn.execute("UPDATE channels SET upstream_rate_factor = 0.1 WHERE id = 26")
+            conn.execute("UPDATE channels SET upstream_rate_factor = 1.0")
             conn.commit()
 init_db()
 
@@ -555,7 +556,7 @@ def get_rates():
                 for r in rows}
 
 # ── 上游倍率自动同步 ──
-DEFAULT_TARGET_GROUP_RATE = 0.18
+DEFAULT_TARGET_GROUP_RATE = 1.0
 
 
 def _float_setting(key, default):
@@ -566,7 +567,7 @@ def _float_setting(key, default):
 
 
 def get_target_group_rate():
-    """全局系数：最终本地系数 = 全局系数 - 上游倍率 × 折算。"""
+    """全局系数：最终系数 = (全局系数 - 上游倍率 × 折算) × 系数。"""
     return _float_setting("rate_auto_target", DEFAULT_TARGET_GROUP_RATE)
 
 
@@ -575,7 +576,9 @@ def compute_auto_rate(upstream_rate, factor=None, target_rate=None):
         return None
     factor = 1.0 if factor is None else float(factor)
     target_rate = get_target_group_rate() if target_rate is None else float(target_rate)
-    # 保留 6 位足够覆盖 0.001 级输入，同时避免 0.139999999 这类浮点噪音。
+    # 最终系数 = (全局系数 - 上游倍率 × 折算)
+    # 注意：这里算出来的是"基础系数"，后续 real_cost = usd × rate 时
+    # 如果需要额外乘以手动系数，rate 字段本身就是那个系数。
     return round(max(target_rate - float(upstream_rate) * factor, 0.0), 6)
 
 
@@ -835,7 +838,7 @@ def _apply_auto_rate_to_channel(conn, cid, upstream_rate, source, now, *, insert
             )
         return changed, new_rate
     if insert_if_missing:
-        factor = insert_if_missing.get("upstream_rate_factor", 0.1 if cid == 26 else 1.0)
+        factor = insert_if_missing.get("upstream_rate_factor", 1.0)
         new_rate = compute_auto_rate(upstream_rate, factor)
         conn.execute(
             """
@@ -1406,9 +1409,7 @@ def api_sync_channels():
     """Pull all channels from new-api and reconcile the local channels table.
 
     Also refresh upstream Sub2API multipliers when balance credentials are configured:
-      local rate = 全局系数 - 上游倍率 × 折算
-    Channel 26 keeps a default 折算=0.1 because its Plus-pool multiplier represents
-    a larger upstream bucket than the real token cost.
+      最终系数 = (全局系数 − 上游倍率 × 折算) × 系数
     """
     if not _control_settings()[0]:
         raise HTTPException(400, "未配置 new-api 控制凭据，无法同步")
@@ -1460,7 +1461,7 @@ def api_sync_channels():
                     _apply_auto_rate_to_channel(
                         conn, cid, auto["upstream_rate"], auto.get("source") or "upstream", now,
                         insert_if_missing={"name": name, "base_url": base_url,
-                                           "upstream_rate_factor": 0.1 if cid == 26 else 1.0},
+                                           "upstream_rate_factor": 1.0},
                     )
                 else:
                     conn.execute(
