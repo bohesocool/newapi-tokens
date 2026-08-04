@@ -148,13 +148,43 @@ if [[ -f .env ]]; then
     [[ -n "$EXISTING_GROUP" ]] && TRACK_GROUP="$EXISTING_GROUP"
 fi
 
-# 交互式询问追踪分组（非交互模式跳过）
+# ── 从 NewAPI 数据库查出可用分组，交互式选择 ──
 if [[ -t 0 ]]; then
     echo ""
-    info "追踪分组配置（直接回车使用默认值）"
-    read -rp "  追踪分组 [default]: " INPUT_GROUP
-    if [[ -n "$INPUT_GROUP" ]]; then
-        TRACK_GROUP="$INPUT_GROUP"
+    info "正在从 NewAPI 数据库查询可用分组..."
+
+    # 用 docker exec 进 postgres 容器查 distinct group
+    GROUPS=""
+    if docker inspect postgres >/dev/null 2>&1; then
+        GROUPS=$(docker exec postgres psql -U "${PG_USER:-root}" -d "${PG_DB:-new-api}" -t -A -c \
+            "SELECT DISTINCT \"group\" FROM tokens WHERE \"group\" IS NOT NULL AND \"group\" <> '' ORDER BY 1;" 2>/dev/null || true)
+    fi
+
+    if [[ -n "$GROUPS" ]]; then
+        # 转成数组
+        mapfile -t GROUP_LIST <<< "$GROUPS"
+        echo ""
+        echo -e "${CYAN}  可用分组:${NC}"
+        for i in "${!GROUP_LIST[@]}"; do
+            num=$((i + 1))
+            marker=""
+            [[ "${GROUP_LIST[$i]}" == "$TRACK_GROUP" ]] && marker=" ${GREEN}← 当前${NC}"
+            echo -e "    $num) ${GROUP_LIST[$i]}$marker"
+        done
+        echo ""
+        read -rp "  选择追踪分组 (输入序号或直接输入名称，回车保持 [$TRACK_GROUP]): " INPUT_GROUP
+        if [[ -n "$INPUT_GROUP" ]]; then
+            # 如果是纯数字，按序号选
+            if [[ "$INPUT_GROUP" =~ ^[0-9]+$ ]] && [[ "$INPUT_GROUP" -ge 1 ]] && [[ "$INPUT_GROUP" -le "${#GROUP_LIST[@]}" ]]; then
+                TRACK_GROUP="${GROUP_LIST[$((INPUT_GROUP - 1))]}"
+            else
+                TRACK_GROUP="$INPUT_GROUP"
+            fi
+        fi
+    else
+        warn "无法从数据库查询分组（postgres 容器不可用或无分组数据）"
+        read -rp "  追踪分组 [default]: " INPUT_GROUP
+        [[ -n "$INPUT_GROUP" ]] && TRACK_GROUP="$INPUT_GROUP"
     fi
     log "追踪分组: $TRACK_GROUP"
     echo ""
@@ -190,14 +220,48 @@ if [[ "$NETWORK" != "new-api_new-api-network" ]]; then
     fi
 fi
 
-# ── 构建 ──
-log "构建 Docker 镜像..."
-docker compose build --no-cache newapi-monitor 2>&1 | tail -5
-docker compose build --no-cache tg-relay 2>&1 | tail -3
+# ── 构建（只在代码变化时重建） ──
+# 判断是否需要重建：对比当前镜像和代码是否有变化
+NEED_REBUILD=false
+CURRENT_IMAGE_ID=$(docker images --format '{{.ID}}' newapi-tokens-newapi-monitor:latest 2>/dev/null || echo "")
+if [[ -z "$CURRENT_IMAGE_ID" ]]; then
+    NEED_REBUILD=true
+    log "首次构建，没有现有镜像"
+else
+    # 检查 app/ 和 relay/ 目录是否有变化（对比 git status 或文件时间戳）
+    # 方法：用 docker inspect 拿当前镜像的创建时间，和 app/ 下最新文件比较
+    IMAGE_CREATED=$(docker inspect newapi-tokens-newapi-monitor:latest --format '{{.Created}}' 2>/dev/null | cut -d. -f1 || echo "")
+    NEWEST_FILE=$(find app/ relay/ -type f -newer /tmp/dummy_marker 2>/dev/null | head -1 || true)
+    # 更简单的方式：比较 git HEAD 和镜像构建时间
+    if [[ -d .git ]]; then
+        GIT_CHANGED=$(git status --porcelain app/ relay/ requirements.txt Dockerfile 2>/dev/null | head -1 || true)
+        if [[ -n "$GIT_CHANGED" ]]; then
+            NEED_REBUILD=true
+            info "检测到代码变更，将重新构建"
+        fi
+    fi
+    # 如果 git pull 后代码变了但 git status 是 clean 的，对比镜像时间和最新 commit
+    if ! $NEED_REBUILD && [[ -d .git ]]; then
+        LAST_COMMIT_TIME=$(git log -1 --format='%ct' 2>/dev/null || echo 0)
+        IMAGE_TIMESTAMP=$(docker inspect newapi-tokens-newapi-monitor:latest --format '{{.Created}}' 2>/dev/null | python3 -c "import sys; from datetime import datetime; print(int(datetime.fromisoformat(sys.stdin.read().strip().replace('Z','+00:00')).timestamp()))" 2>/dev/null || echo 0)
+        if [[ "$LAST_COMMIT_TIME" -gt "$IMAGE_TIMESTAMP" ]]; then
+            NEED_REBUILD=true
+            info "检测到 git pull 后有新提交，将重新构建"
+        fi
+    fi
+fi
 
-# ── 启动 ──
+if $NEED_REBUILD; then
+    log "构建 Docker 镜像..."
+    docker compose build --no-cache newapi-monitor 2>&1 | tail -5
+    docker compose build --no-cache tg-relay 2>&1 | tail -3
+else
+    log "代码无变化，跳过构建"
+fi
+
+# ── 启动容器（--force-recreate 确保新的 .env 生效） ──
 log "启动容器..."
-docker compose up -d
+docker compose up -d --force-recreate 2>&1 | tail -10
 
 # ── 等待健康检查 ──
 log "等待健康检查..."
