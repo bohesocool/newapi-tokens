@@ -31,38 +31,88 @@ PG_USER="root"
 PG_DB="new-api"
 PG_PASSWORD=""
 
-# 方法 0: 从 NewAPI 的 docker-compose.yml 直接读取（最可靠，不依赖容器是否在跑）
-NEWAPI_COMPOSE=""
-for p in /root/new-api/docker-compose.yml /root/new-api/docker-compose.yaml \
-         /opt/new-api/docker-compose.yml /../new-api/docker-compose.yml \
-         "$HOME/new-api/docker-compose.yml"; do
-    [[ -f "$p" ]] && NEWAPI_COMPOSE="$p" && break
+# 方法 0: 自动定位 NewAPI 安装目录，从 docker-compose.yml 或 .env 读取
+NEWAPI_DIR=""
+# 0a: 常见路径
+for d in /root/new-api /opt/new-api "$HOME/new-api" /srv/new-api /app/new-api; do
+    [[ -d "$d" ]] && NEWAPI_DIR="$d" && break
 done
-if [[ -n "$NEWAPI_COMPOSE" ]] && [[ -z "$PG_PASSWORD" ]]; then
-    # 从 SQL_DSN=postgresql://user:password@host:port/db 解析
-    DSN_LINE=$(grep -E 'SQL_DSN\s*=' "$NEWAPI_COMPOSE" | grep -v '^\s*#' | grep -v 'mysql\|clickhouse' | head -1 || true)
-    if [[ -n "$DSN_LINE" ]]; then
-        DSN_VALUE=$(echo "$DSN_LINE" | sed -E 's/.*SQL_DSN\s*=\s*//; s/\s*#.*//' | tr -d '"' | tr -d "'")
-        if [[ "$DSN_VALUE" =~ postgresql://([^:]+):([^@]+)@([^:]+):([0-9]+)/([^?]+) ]]; then
-            PG_USER="${BASH_REMATCH[1]}"
-            PG_PASSWORD="${BASH_REMATCH[2]}"
-            PG_HOST="${BASH_REMATCH[3]}"
-            PG_PORT="${BASH_REMATCH[4]}"
-            PG_DB="${BASH_REMATCH[5]}"
-        elif [[ "$DSN_VALUE" =~ postgresql://([^:]+):([^@]+)@([^/]+)/(.+) ]]; then
-            PG_USER="${BASH_REMATCH[1]}"
-            PG_PASSWORD="${BASH_REMATCH[2]}"
-            PG_HOST="${BASH_REMATCH[3]}"
-            PG_DB="${BASH_REMATCH[4]}"
+# 0b: 用 docker inspect 找 new-api 容器的工作目录（compose label）
+if [[ -z "$NEWAPI_DIR" ]] && docker inspect new-api >/dev/null 2>&1; then
+    NEWAPI_DIR=$(docker inspect new-api --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
+fi
+# 0c: 用 docker inspect 找 compose 配置文件路径
+if [[ -z "$NEWAPI_DIR" ]] && docker inspect new-api >/dev/null 2>&1; then
+    CFG=$(docker inspect new-api --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
+    if [[ -n "$CFG" ]]; then
+        NEWAPI_DIR=$(dirname "$CFG" 2>/dev/null || true)
+    fi
+fi
+
+if [[ -n "$NEWAPI_DIR" ]]; then
+    info "NewAPI 安装目录: $NEWAPI_DIR"
+fi
+
+# 0d: 从 docker-compose.yml 读取
+if [[ -n "$NEWAPI_DIR" ]] && [[ -z "$PG_PASSWORD" ]]; then
+    for f in "$NEWAPI_DIR/docker-compose.yml" "$NEWAPI_DIR/docker-compose.yaml"; do
+        [[ -f "$f" ]] && NEWAPI_COMPOSE="$f" && break
+    done
+    if [[ -n "$NEWAPI_COMPOSE" ]]; then
+        DSN_LINE=$(grep -E 'SQL_DSN\s*=' "$NEWAPI_COMPOSE" | grep -v '^\s*#' | grep -v 'mysql\|clickhouse' | head -1 || true)
+        if [[ -n "$DSN_LINE" ]]; then
+            DSN_VALUE=$(echo "$DSN_LINE" | sed -E 's/.*SQL_DSN\s*=\s*//; s/\s*#.*//' | tr -d '"' | tr -d "'")
+            if [[ "$DSN_VALUE" =~ postgresql://([^:]+):([^@]+)@([^:]+):([0-9]+)/([^?]+) ]]; then
+                PG_USER="${BASH_REMATCH[1]}"
+                PG_PASSWORD="${BASH_REMATCH[2]}"
+                PG_HOST="${BASH_REMATCH[3]}"
+                PG_PORT="${BASH_REMATCH[4]}"
+                PG_DB="${BASH_REMATCH[5]}"
+            elif [[ "$DSN_VALUE" =~ postgresql://([^:]+):([^@]+)@([^/]+)/(.+) ]]; then
+                PG_USER="${BASH_REMATCH[1]}"
+                PG_PASSWORD="${BASH_REMATCH[2]}"
+                PG_HOST="${BASH_REMATCH[3]}"
+                PG_DB="${BASH_REMATCH[4]}"
+            fi
         fi
+        # 如果 SQL_DSN 没解析到密码，从 POSTGRES_PASSWORD 读
+        if [[ -z "$PG_PASSWORD" ]]; then
+            PG_PASSWORD=$(grep -E 'POSTGRES_PASSWORD\s*=' "$NEWAPI_COMPOSE" | grep -v '^\s*#' | head -1 | sed -E 's/.*POSTGRES_PASSWORD\s*=\s*//' | tr -d '"' | tr -d "'" | tr -d ' ' || true)
+        fi
+        [[ -n "$PG_PASSWORD" ]] && info "从 docker-compose.yml 探测到: host=$PG_HOST user=$PG_USER db=$PG_DB"
     fi
-    # 如果 SQL_DSN 没解析到密码，从 POSTGRES_PASSWORD 读
-    if [[ -z "$PG_PASSWORD" ]]; then
-        PG_PASSWORD=$(grep -E 'POSTGRES_PASSWORD\s*=' "$NEWAPI_COMPOSE" | grep -v '^\s*#' | head -1 | sed -E 's/.*POSTGRES_PASSWORD\s*=\s*//' | tr -d '"' | tr -d "'" | tr -d ' ' || true)
-    fi
-    if [[ -n "$PG_PASSWORD" ]]; then
-        info "从 NewAPI docker-compose.yml 探测到: host=$PG_HOST user=$PG_USER db=$PG_DB"
-    fi
+fi
+
+# 0e: 如果 compose 没找到，从 .env 读
+if [[ -n "$NEWAPI_DIR" ]] && [[ -z "$PG_PASSWORD" ]]; then
+    for f in "$NEWAPI_DIR/.env" "$NEWAPI_DIR/.env.production"; do
+        if [[ -f "$f" ]]; then
+            PG_PASSWORD=$(grep -E '^PG_PASSWORD\s*=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+            PG_HOST=$(grep -E '^PG_HOST\s*=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+            PG_USER=$(grep -E '^PG_USER\s*=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+            PG_DB=$(grep -E '^PG_DB\s*=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+            # 也试试 SQL_DSN 格式
+            if [[ -z "$PG_PASSWORD" ]]; then
+                DSN_LINE=$(grep -E '^SQL_DSN\s*=' "$f" 2>/dev/null | head -1 || true)
+                if [[ -n "$DSN_LINE" ]]; then
+                    DSN_VALUE=$(echo "$DSN_LINE" | sed -E 's/^SQL_DSN\s*=\s*//' | tr -d '"' | tr -d "'")
+                    if [[ "$DSN_VALUE" =~ postgresql://([^:]+):([^@]+)@([^:]+):([0-9]+)/([^?]+) ]]; then
+                        PG_USER="${BASH_REMATCH[1]}"
+                        PG_PASSWORD="${BASH_REMATCH[2]}"
+                        PG_HOST="${BASH_REMATCH[3]}"
+                        PG_PORT="${BASH_REMATCH[4]}"
+                        PG_DB="${BASH_REMATCH[5]}"
+                    fi
+                fi
+            fi
+            # 也试 POSTGRES_PASSWORD
+            if [[ -z "$PG_PASSWORD" ]]; then
+                PG_PASSWORD=$(grep -E '^POSTGRES_PASSWORD\s*=' "$f" 2>/dev/null | cut -d= -f2- | tr -d '"' | tr -d "'" || true)
+            fi
+            [[ -n "$PG_PASSWORD" ]] && info "从 .env 探测到: host=$PG_HOST user=$PG_USER db=$PG_DB"
+            break
+        fi
+    done
 fi
 
 # 方法 1: 从 new-api 容器环境变量读取（如果方法 0 没找到）
