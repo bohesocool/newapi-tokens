@@ -31,8 +31,42 @@ PG_USER="root"
 PG_DB="new-api"
 PG_PASSWORD=""
 
-# 方法 1: 从 new-api 容器环境变量读取
-if docker inspect new-api >/dev/null 2>&1; then
+# 方法 0: 从 NewAPI 的 docker-compose.yml 直接读取（最可靠，不依赖容器是否在跑）
+NEWAPI_COMPOSE=""
+for p in /root/new-api/docker-compose.yml /root/new-api/docker-compose.yaml \
+         /opt/new-api/docker-compose.yml /../new-api/docker-compose.yml \
+         "$HOME/new-api/docker-compose.yml"; do
+    [[ -f "$p" ]] && NEWAPI_COMPOSE="$p" && break
+done
+if [[ -n "$NEWAPI_COMPOSE" ]] && [[ -z "$PG_PASSWORD" ]]; then
+    # 从 SQL_DSN=postgresql://user:password@host:port/db 解析
+    DSN_LINE=$(grep -E 'SQL_DSN\s*=' "$NEWAPI_COMPOSE" | grep -v '^\s*#' | grep -v 'mysql\|clickhouse' | head -1 || true)
+    if [[ -n "$DSN_LINE" ]]; then
+        DSN_VALUE=$(echo "$DSN_LINE" | sed -E 's/.*SQL_DSN\s*=\s*//; s/\s*#.*//' | tr -d '"' | tr -d "'")
+        if [[ "$DSN_VALUE" =~ postgresql://([^:]+):([^@]+)@([^:]+):([0-9]+)/([^?]+) ]]; then
+            PG_USER="${BASH_REMATCH[1]}"
+            PG_PASSWORD="${BASH_REMATCH[2]}"
+            PG_HOST="${BASH_REMATCH[3]}"
+            PG_PORT="${BASH_REMATCH[4]}"
+            PG_DB="${BASH_REMATCH[5]}"
+        elif [[ "$DSN_VALUE" =~ postgresql://([^:]+):([^@]+)@([^/]+)/(.+) ]]; then
+            PG_USER="${BASH_REMATCH[1]}"
+            PG_PASSWORD="${BASH_REMATCH[2]}"
+            PG_HOST="${BASH_REMATCH[3]}"
+            PG_DB="${BASH_REMATCH[4]}"
+        fi
+    fi
+    # 如果 SQL_DSN 没解析到密码，从 POSTGRES_PASSWORD 读
+    if [[ -z "$PG_PASSWORD" ]]; then
+        PG_PASSWORD=$(grep -E 'POSTGRES_PASSWORD\s*=' "$NEWAPI_COMPOSE" | grep -v '^\s*#' | head -1 | sed -E 's/.*POSTGRES_PASSWORD\s*=\s*//' | tr -d '"' | tr -d "'" | tr -d ' ' || true)
+    fi
+    if [[ -n "$PG_PASSWORD" ]]; then
+        info "从 NewAPI docker-compose.yml 探测到: host=$PG_HOST user=$PG_USER db=$PG_DB"
+    fi
+fi
+
+# 方法 1: 从 new-api 容器环境变量读取（如果方法 0 没找到）
+if [[ -z "$PG_PASSWORD" ]] && docker inspect new-api >/dev/null 2>&1; then
     SQL_DSN=$(docker inspect new-api --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | grep '^SQL_DSN=' | head -1 || true)
     if [[ -n "$SQL_DSN" ]]; then
         # 解析 postgresql://user:password@host:port/db
