@@ -154,11 +154,24 @@ if [[ -t 0 ]]; then
     info "正在从 NewAPI 数据库查询可用分组..."
 
     # 用 docker exec 进 postgres 容器查 distinct group
+    # 整段用子 shell 包裹，任何失败都不会让 set -e 杀掉脚本
     GROUPS=""
-    if docker inspect postgres >/dev/null 2>&1; then
-        GROUPS=$(docker exec postgres psql -U "${PG_USER:-root}" -d "${PG_DB:-new-api}" -t -A -c \
-            "SELECT DISTINCT \"group\" FROM tokens WHERE \"group\" IS NOT NULL AND \"group\" <> '' ORDER BY 1;" 2>/dev/null || true)
-    fi
+    {
+        if docker inspect postgres >/dev/null 2>&1; then
+            CONTAINER_NAME="postgres"
+        elif docker inspect "${PG_HOST:-postgres}" >/dev/null 2>&1; then
+            CONTAINER_NAME="${PG_HOST}"
+        else
+            CONTAINER_NAME=""
+        fi
+        if [[ -n "$CONTAINER_NAME" ]]; then
+            docker exec -e PGPASSWORD="${PG_PASSWORD}" "$CONTAINER_NAME" \
+                psql -U "${PG_USER:-root}" -d "${PG_DB:-new-api}" -t -A -c \
+                "SELECT DISTINCT \"group\" FROM tokens WHERE \"group\" IS NOT NULL AND \"group\" <> '' ORDER BY 1;" 2>/dev/null
+        fi
+    } | while read -r line; do [[ -n "$line" ]] && echo "$line"; done > /tmp/na_groups.txt 2>/dev/null || true
+    GROUPS=$(cat /tmp/na_groups.txt 2>/dev/null || true)
+    rm -f /tmp/na_groups.txt 2>/dev/null || true
 
     if [[ -n "$GROUPS" ]]; then
         # 转成数组
