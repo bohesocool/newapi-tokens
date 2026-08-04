@@ -31,26 +31,36 @@ PG_USER="root"
 PG_DB="new-api"
 PG_PASSWORD=""
 
-# 方法 0: 自动定位 NewAPI 安装目录，从 docker-compose.yml 或 .env 读取
+# 方法 0: 精准定位 NewAPI 安装目录
 NEWAPI_DIR=""
-# 0a: 常见路径
-for d in /root/new-api /opt/new-api "$HOME/new-api" /srv/new-api /app/new-api; do
-    [[ -d "$d" ]] && NEWAPI_DIR="$d" && break
-done
-# 0b: 用 docker inspect 找 new-api 容器的工作目录（compose label）
-if [[ -z "$NEWAPI_DIR" ]] && docker inspect new-api >/dev/null 2>&1; then
+# 0a: 从 Docker compose label 直接拿（最精准，Docker 自己记录的）
+if docker inspect new-api >/dev/null 2>&1; then
     NEWAPI_DIR=$(docker inspect new-api --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
-fi
-# 0c: 用 docker inspect 找 compose 配置文件路径
-if [[ -z "$NEWAPI_DIR" ]] && docker inspect new-api >/dev/null 2>&1; then
-    CFG=$(docker inspect new-api --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
-    if [[ -n "$CFG" ]]; then
-        NEWAPI_DIR=$(dirname "$CFG" 2>/dev/null || true)
+    # 如果 working_dir 没有但 config_files 有，取 dirname
+    if [[ -z "$NEWAPI_DIR" ]]; then
+        CFG=$(docker inspect new-api --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
+        [[ -n "$CFG" ]] && NEWAPI_DIR=$(dirname "$CFG")
     fi
+fi
+# 0b: 如果 new-api 容器不存在，试试找 postgres 容器（NewAPI 的 PG 通常叫 postgres）
+if [[ -z "$NEWAPI_DIR" ]] && docker inspect postgres >/dev/null 2>&1; then
+    NEWAPI_DIR=$(docker inspect postgres --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' 2>/dev/null || true)
+    if [[ -z "$NEWAPI_DIR" ]]; then
+        CFG=$(docker inspect postgres --format '{{index .Config.Labels "com.docker.compose.project.config_files"}}' 2>/dev/null || true)
+        [[ -n "$CFG" ]] && NEWAPI_DIR=$(dirname "$CFG")
+    fi
+fi
+# 0c: 最后 fallback 常见路径
+if [[ -z "$NEWAPI_DIR" ]]; then
+    for d in /root/new-api /opt/new-api "$HOME/new-api" /srv/new-api /app/new-api /home/new-api; do
+        [[ -d "$d" ]] && NEWAPI_DIR="$d" && break
+    done
 fi
 
 if [[ -n "$NEWAPI_DIR" ]]; then
     info "NewAPI 安装目录: $NEWAPI_DIR"
+else
+    warn "未找到 NewAPI 安装目录，尝试从容器环境变量探测"
 fi
 
 # 0d: 从 docker-compose.yml 读取
