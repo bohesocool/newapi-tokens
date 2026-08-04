@@ -115,6 +115,22 @@ if [[ -f .env ]]; then
     TG_CHAT_ID=$(grep '^TG_CHAT_ID=' .env 2>/dev/null | cut -d= -f2- || true)
 fi
 
+# 如果没有 Telegram 配置，交互式询问（非交互模式跳过）
+if [[ -z "$TG_BOT_TOKEN" ]] && [[ -t 0 ]]; then
+    echo ""
+    info "Telegram 推送配置（可选，直接回车跳过）"
+    read -rp "  Bot Token: " INPUT_TOKEN
+    if [[ -n "$INPUT_TOKEN" ]]; then
+        TG_BOT_TOKEN="$INPUT_TOKEN"
+        read -rp "  Chat ID:   " INPUT_CHAT
+        TG_CHAT_ID="$INPUT_CHAT"
+        log "Telegram 已配置: chat_id=$TG_CHAT_ID"
+    else
+        warn "跳过 Telegram 配置（可稍后手动编辑 .env）"
+    fi
+    echo ""
+fi
+
 # ── 生成 .env ──
 log "生成 .env..."
 
@@ -202,7 +218,7 @@ echo "  仪表盘:    http://$(hostname -I 2>/dev/null | awk '{print $1}' || ech
 echo "  管理密码:  $ADMIN_PASSWORD"
 echo "  数据库:    $PG_USER@$PG_HOST:$PG_PORT/$PG_DB"
 echo "  跟踪令牌:  $TOKEN_NAME"
-echo "  Telegram: $([[ -n '$TG_BOT_TOKEN' ]] && echo '已配置' || echo '未配置')"
+echo "  Telegram: $([[ -n "$TG_BOT_TOKEN" ]] && echo '已配置' || echo '未配置')"
 echo ""
 echo "  查看日志:  docker logs -f newapi-monitor"
 echo "  停止:      cd $SCRIPT_DIR && docker compose down"
