@@ -215,7 +215,13 @@ def seed_settings():
     if not get_setting("api_key"):
         set_setting("api_key", gen_api_key())
     if not get_setting("admin_password"):
-        initial = os.environ.get("ADMIN_PASSWORD", "admin")
+        initial = os.environ.get("ADMIN_PASSWORD", "").strip()
+        if not initial:
+            # No password provided via env — generate a random one so the app
+            # never boots with a guessable default. The deploy script prints
+            # it to stdout; without the script, check the container logs.
+            initial = secrets.token_urlsafe(12)
+            print(f"[Startup] No ADMIN_PASSWORD set — generated random password: {initial}", flush=True)
         set_setting("admin_password", hash_password(initial))
 
 seed_settings()

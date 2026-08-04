@@ -230,11 +230,27 @@ fi
 # ── 生成 .env ──
 log "生成 .env..."
 
-# 保留现有 ADMIN_PASSWORD 或生成默认
-ADMIN_PASSWORD="bohesobad123."
-if [[ -f .env ]]; then
+# ── 管理员密码 ──
+# 优先级: --admin-password <参数> > $ADMIN_PASSWORD <环境变量> > 现有 .env > 随机生成
+# 首次部署时自动生成 16 位随机字母数字密码；已有 .env 则保留旧密码。
+ADMIN_PASSWORD=""
+# 命令行参数: start.sh --admin-password 'mypassword'
+if [[ "$1" == "--admin-password" ]]; then
+    ADMIN_PASSWORD="$2"
+fi
+# 环境变量
+if [[ -z "$ADMIN_PASSWORD" ]] && [[ -n "${ADMIN_PASSWORD:-}" ]]; then
+    ADMIN_PASSWORD="${ADMIN_PASSWORD}"
+fi
+# 保留现有 .env 中的密码
+if [[ -z "$ADMIN_PASSWORD" ]] && [[ -f .env ]]; then
     EXISTING_ADMIN_PW=$(grep '^ADMIN_PASSWORD=' .env 2>/dev/null | cut -d= -f2- || true)
     [[ -n "$EXISTING_ADMIN_PW" ]] && ADMIN_PASSWORD="$EXISTING_ADMIN_PW"
+fi
+# 首次部署：生成随机密码（16 位字母+数字）
+if [[ -z "$ADMIN_PASSWORD" ]]; then
+    ADMIN_PASSWORD=$(python3 -c "import secrets, string; print(''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(16)))" 2>/dev/null || head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)
+    info "首次部署，已自动生成随机管理密码"
 fi
 
 # 保留现有 TRACK_GROUP
